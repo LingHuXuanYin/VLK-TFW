@@ -4,7 +4,7 @@
 
 - 后端：FastAPI（模型常驻显存，只加载一次）
 - 前端：原生 HTML/CSS/JS，ES module 零构建
-- 代码分三组物理隔离：`features/`（业务逻辑，无 DOM）/ `web/`（UI）/ `backend/`（Python），`shared/` 放类型契约与常量
+- 源码统一放 `src/`，按三组物理隔离：`src/features/`（业务逻辑，无 DOM）/ `src/web/`（UI）/ `src/backend/`（Python），`src/shared/` 放类型契约与常量
 - 任务划分：开放问答 / 检测与定位 / 区域理解 三组，共 7 个任务
 - 图像上直接叠加候选框，点选即可指定区域任务的 `target_region_indexes`
 
@@ -37,7 +37,7 @@
 双击后是一个 tkinter 客户端，不依赖浏览器和命令行：
 
 - **端口**：输入框里改，启动时写入 `config.ini`，`run.bat` / `debug.bat` 读同一份配置，不会各跑各的端口
-- **启动服务**：用 `..\VLX-Seek\.venv\Scripts\python.exe app.py` 拉起，进程隐藏，日志追加到 `server.log`
+- **启动服务**：用 `..\VLX-Seek\.venv\Scripts\python.exe src\main.py` 拉起，进程隐藏，日志追加到 `server.log`
 - **停止服务**：优先停自己拉起的进程；如果是 `run.bat` 起的，会按端口找到监听进程再 kill
 - **状态**：每秒轮询 `/api/status`，显示 `未运行 / 启动中 / loading / ready / 出错`、设备、加载耗时
 - **日志**：面板实时显示 `server.log` 末尾，已过滤 tqdm 进度条和自身轮询产生的 `/api/status` 访问记录
@@ -49,7 +49,7 @@
 命令行参数  >  环境变量 PORT  >  config.ini 的 port  >  7860
 ```
 
-改完 `launcher.py` 要重新打包时，双击 `build_launcher.bat`（需要本机 Python 3.10+ 带 tkinter 和 PyInstaller）。
+改完 `src/launcher.py` 要重新打包时，双击 `build_launcher.bat`（需要本机 Python 3.10+ 带 tkinter 和 PyInstaller）。
 
 > 注意：`.bat` 文件是 **GBK(ANSI) + CRLF** 编码，用编辑器改完请保持原编码，另存为 UTF-8 会导致 cmd 解析错行、中文提示乱码。
 
@@ -168,58 +168,73 @@
 
 ```
 Taozi-VLX-deepseek/
-├── 启动器.exe              # 桌面启动器（双击用；改完 launcher.py 用 build_launcher.bat 重打包）
-├── launcher.py             # 启动器源码：端口配置 / 启停服务 / 状态轮询 / 日志面板
-├── build_launcher.bat      # 重新打包启动器
-├── app.py                  # 入口薄壳：sys.path 兜底 + 交给 backend.app.main（保持 python app.py 契约）
-├── _env.bat                # run.bat / debug.bat 共用的环境变量与端口解析
-├── run.bat                 # 前台启动（日志打在窗口里）
-├── debug.bat               # 后台启动（日志落 server.log，超 20MB 自动归档）
-├── config.ini              # 端口/监听地址，启动器与两个 bat 共用
-├── server.log              # 服务日志（由 debug.bat / 启动器写入，运行时可安全忽略）
-├── assets/launcher.ico     # 启动器图标
+├── src/                        # 全部源码只在这里
+│   ├── main.py                 # 服务入口薄壳：sys.path 兜底 + 交给 backend.app.main
+│   ├── launcher.py             # 启动器源码：端口配置 / 启停服务 / 状态轮询 / 日志面板
+│   ├── backend/app/            # Python 后端（分层单向依赖）
+│   │   ├── config.py           # 唯一读取环境变量与拼路径的地方（含 chdir 到 VLX-Seek）
+│   │   ├── schemas.py          # pydantic 请求模型 + ImageMeta/ModelStatus 契约
+│   │   ├── errors.py           # ApiError：services 不依赖 fastapi 的关键
+│   │   ├── protocols/          # ImageStore / ProposalSource / VisionWorker+WorkerProvider / TaskRunner
+│   │   ├── services/           # task_catalog 元数据、image_store、wedetect_source、
+│   │   │                       # model_runtime 状态机、task_runner 派发、suite_runner 编排
+│   │   ├── deps.py             # 组装根：单例在此创建，路由用 Depends 取
+│   │   ├── routers/            # meta / status / images / proposals / tasks
+│   │   └── main.py             # 应用组装：lifespan、异常翻译、静态挂载、路由注册
+│   ├── features/               # 业务逻辑：框架无关、无 DOM、无状态
+│   │   ├── api/http-client.js  # 注入 fetch 的 HTTP 客户端（含 ApiError）
+│   │   ├── api/vlx-api.js      # 端点适配器，UI 层唯一数据出入口
+│   │   ├── task/task-catalog.js# 分组 / 序号 / 模板取值
+│   │   ├── form/form-model.js  # 默认值 / 持久化合并 / 请求体构造 / 索引解析 / 校验
+│   │   ├── bbox/bbox-geometry.js # 坐标映射 / 命中测试 / 配色 / 粘贴 JSON 校验 / 画布尺寸
+│   │   └── suite/suite-summary.js# 全量结果统计与答案摘要
+│   ├── web/                    # Web UI：持有状态、渲染 DOM、操作画布
+│   │   ├── index.html          # 结构与元素 id（41 个）
+│   │   ├── style.css
+│   │   ├── main.js             # 状态 + 事件绑定 + 编排
+│   │   ├── storage.js          # localStorage 读写
+│   │   ├── dom.js              # $ / esc
+│   │   ├── canvas/annotator.js # 画布绘制与点选
+│   │   └── render/             # nav / form / result / suite 四块渲染
+│   └── shared/contracts.js     # JSDoc 契约（TaskMeta/TaskResult/...）+ PALETTE/存储键
+├── 启动器.exe                  # 桌面启动器（双击用；改完 src/launcher.py 用 build_launcher.bat 重打包）
+├── build_launcher.bat          # 重新打包启动器（PyInstaller 入口 src/launcher.py）
+├── _env.bat                    # run.bat / debug.bat 共用的环境变量与端口解析（导出 VLX_ENTRY）
+├── run.bat                     # 前台启动（日志打在窗口里）
+├── debug.bat                   # 后台启动（日志落 server.log，超 20MB 自动归档）
+├── config.ini                  # 端口/监听地址，启动器与两个 bat 共用
+├── server.log                  # 服务日志（由 debug.bat / 启动器写入，运行时可安全忽略）
+├── assets/launcher.ico         # 构建资源：启动器图标（PyInstaller --icon 用）
 ├── requirements.txt
-├── backend/app/            # Python 后端（分层单向依赖）
-│   ├── config.py           # 唯一读取环境变量与拼路径的地方（含 chdir 到 VLX-Seek）
-│   ├── schemas.py          # pydantic 请求模型 + ImageMeta/ModelStatus 契约
-│   ├── errors.py           # ApiError：services 不依赖 fastapi 的关键
-│   ├── protocols/          # ImageStore / ProposalSource / VisionWorker+WorkerProvider / TaskRunner
-│   ├── services/           # task_catalog 元数据、image_store、wedetect_source、
-│   │                       # model_runtime 状态机、task_runner 派发、suite_runner 编排
-│   ├── deps.py             # 组装根：单例在此创建，路由用 Depends 取
-│   ├── routers/            # meta / status / images / proposals / tasks
-│   └── main.py             # 应用组装：lifespan、异常翻译、静态挂载、路由注册
-├── features/               # 业务逻辑：框架无关、无 DOM、无状态
-│   ├── api/http-client.js  # 注入 fetch 的 HTTP 客户端（含 ApiError）
-│   ├── api/vlx-api.js      # 端点适配器，UI 层唯一数据出入口
-│   ├── task/task-catalog.js# 分组 / 序号 / 模板取值
-│   ├── form/form-model.js  # 默认值 / 持久化合并 / 请求体构造 / 索引解析 / 校验
-│   ├── bbox/bbox-geometry.js # 坐标映射 / 命中测试 / 配色 / 粘贴 JSON 校验 / 画布尺寸
-│   └── suite/suite-summary.js# 全量结果统计与答案摘要
-├── web/                    # Web UI：持有状态、渲染 DOM、操作画布
-│   ├── index.html          # 结构与元素 id（41 个）
-│   ├── style.css
-│   ├── main.js             # 状态 + 事件绑定 + 编排
-│   ├── storage.js          # localStorage 读写
-│   ├── dom.js              # $ / esc
-│   ├── canvas/annotator.js # 画布绘制与点选
-│   └── render/             # nav / form / result / suite 四块渲染
-├── shared/contracts.js     # JSDoc 契约（TaskMeta/TaskResult/...）+ PALETTE/存储键
-├── docs/                   # requirements.md / product-spec.md / iteration-report.md
-└── data/images/            # 上传图 + 候选框缓存（可随时删除）
+├── docs/                       # requirements.md / product-spec.md / iteration-report.md
+└── data/images/                # 运行时数据：上传图 + 候选框缓存（可随时删除）
 ```
+
+**为什么这么分**：`src/` 内全部是「可执行 / 可加载」的源码与前端资源；项目根只留启动脚本、配置、
+构建资源、运行时数据和文档。运行时产物（`config.ini`、`server.log`、`data/`、`启动器.exe`）留在根目录，
+不混进源码树。
 
 分层规则（靠目录守，不靠自觉）：
 
 | 规则 | 说明 |
 |---|---|
+| 源码不出 `src/` | 项目根不新建 `api/`、`utils/` 之类的裸源码目录；`main.py` / `launcher.py` 已在 `src/` |
 | `features/` 无 UI | 出现 `document`/`window`/`localStorage`/`wx.` 即越界 |
 | `features/` 无状态 | 不存缓存、不存当前用户、不存上一次结果 |
 | `web/` 不直连网络 | 一律走 `features/api/vlx-api.js`，不出现裸 `fetch` |
 | `backend` 路由不写业务 | `routers/` 里不出现 PIL / torch / 磁盘写入 |
 | 单文件对外功能 ≤ 10 | 超出按子域再拆 |
 
-三个静态挂载点：`/assets` → `web/`，`/features` → `features/`，`/shared` → `shared/`。
-前端用相对路径 import（`/assets/main.js` → `../features/...`），所以三者必须同级挂载；
-`data/`、`server.log` 不对外。
+三个静态挂载点：`/assets` → `src/web/`，`/features` → `src/features/`，`/shared` → `src/shared/`。
+URL 前缀与重构前一致，前端无需改 import；前端用相对路径 import（`/assets/main.js` → `../features/...`），
+所以三者必须同级挂载；`data/`、`server.log` 不对外。
 
+路径锚点（`src/backend/app/config.py`，全项目只此一处拼绝对路径）：
+
+| 常量 | 值 | 用途 |
+|---|---|---|
+| `SRC_ROOT` | `src/` | 源码根：`WEB_DIR` / `FEATURES_DIR` / `SHARED_DIR` 都基于它 |
+| `PROJECT_ROOT` | 项目根 | 运行时产物：`data/images`、`config.ini`、`server.log` |
+
+启动入口对应关系：`run.bat` / `debug.bat` 调用 `%PY% "%VLX_ENTRY%"`（= `src\main.py`），
+`启动器.exe` 直接以 `src/main.py` 为参数拉起；三者 cwd 都是项目根。

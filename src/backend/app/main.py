@@ -1,7 +1,7 @@
 """FastAPI 组装层：lifespan、异常翻译、静态挂载、路由注册。
 
-本文件不做任何业务计算，只负责把 `routers/` 接起来，把 `web/` `features/` `shared/`
-三个目录挂成静态资源。
+本文件不做任何业务计算，只负责把 `routers/` 接起来，把 `src/web` `src/features` `src/shared`
+三个目录挂成静态资源（URL 前缀仍是 `/assets` `/features` `/shared`，对外不变）。
 """
 from __future__ import annotations
 
@@ -53,7 +53,7 @@ def _register_error_handler(application: FastAPI) -> None:
 def _mount_static(application: FastAPI) -> None:
     """挂载前端与 ES module 依赖目录。
 
-    只暴露 web / features / shared 三个目录；`data/`、`server.log` 不对外。
+    只暴露 web / features / shared 三个目录（磁盘位置 `src/` 下）；`data/`、`server.log` 不对外。
     前端使用相对路径 import（`/assets/main.js` → `../features/...`），因此三者必须在同一层级。
     """
     for mount_path, directory in (
@@ -74,7 +74,7 @@ def _register_index(application: FastAPI) -> None:
     def index() -> FileResponse:
         page = WEB_DIR / "index.html"
         if not page.is_file():
-            raise ApiError(404, "前端页面缺失：web/index.html 不存在。")
+            raise ApiError(404, "前端页面缺失：src/web/index.html 不存在。")
         return FileResponse(str(page))
 
 

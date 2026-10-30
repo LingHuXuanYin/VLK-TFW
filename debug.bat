@@ -5,7 +5,7 @@ rem  等价于：
 rem    cd /d "%~dp0"
 rem    set HF_ENDPOINT=https://hf-mirror.com
 rem    set VLX_SEEK_BACKEND=nvidia
-rem    ...\python.exe app.py > server.log 2>&1
+rem    ...\python.exe src\main.py > server.log 2>&1
 rem  区别：端口可配、日志超 20MB 自动归档、退出后回显日志末尾
 rem
 rem  用法：
@@ -38,7 +38,7 @@ echo   停止: Ctrl+C
 echo ========================================
 echo.
 
-"%PY%" app.py > "%VLX_LOG%" 2>&1
+"%PY%" "%VLX_ENTRY%" > "%VLX_LOG%" 2>&1
 set "EXITCODE=%ERRORLEVEL%"
 
 echo.

@@ -2,13 +2,15 @@
 rem ============================================================
 rem  _env.bat —— run.bat / debug.bat 共用的环境准备（不是给人双击的）
 rem  用法：call "%~dp0_env.bat" [端口]
-rem  导出：PY / VLX_PORT / HOST / PORT / VLX_LOG 及模型所需环境变量
+rem  导出：PY / VLX_ENTRY / VLX_PORT / HOST / PORT / VLX_LOG 及模型所需环境变量
 rem  注意：这里不写 setlocal，变量要留在调用方作用域里
 rem ============================================================
 
 set "VLX_HOME=%~dp0"
 set "PY=%VLX_HOME%..\VLX-Seek\.venv\Scripts\python.exe"
 set "VLX_LOG=%VLX_HOME%server.log"
+rem 服务入口：源码在 src/ 下；cwd 仍为项目根（config.ini / server.log 在根）
+set "VLX_ENTRY=%VLX_HOME%src\main.py"
 
 rem ---- 与 VLX-Seek 官方推理脚本一致的环境变量 ----
 set "HF_ENDPOINT=https://hf-mirror.com"

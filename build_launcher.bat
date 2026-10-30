@@ -1,7 +1,7 @@
 @echo off
 rem ============================================================
 rem  build_launcher.bat —— 重新打包「启动器.exe」
-rem  改了 launcher.py 之后双击本脚本即可，产物覆盖到项目根目录
+rem  改了 src\launcher.py 之后双击本脚本即可，产物覆盖到项目根目录
 rem  需要：系统 Python 3.10+（带 tkinter）与 PyInstaller
 rem        C:\Python310\python.exe -m pip install pyinstaller
 rem ============================================================
@@ -25,7 +25,7 @@ if errorlevel 1 (
 
 echo 正在打包启动器……
 "%PY%" -m PyInstaller --noconfirm --clean --onefile --windowed ^
-  --name VLX-Launcher --icon "assets\launcher.ico" launcher.py
+  --name VLX-Launcher --icon "assets\launcher.ico" src\launcher.py
 if errorlevel 1 (
   echo [ERROR] 打包失败，看上面的输出
   pause

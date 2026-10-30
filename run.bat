@@ -35,7 +35,7 @@ echo   端口来源: 参数 ^> PORT 环境变量 ^> config.ini ^> 7860
 echo ========================================
 echo.
 
-"%PY%" app.py
+"%PY%" "%VLX_ENTRY%"
 set "EXITCODE=%ERRORLEVEL%"
 
 echo.

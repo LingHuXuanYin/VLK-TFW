@@ -7,10 +7,13 @@
   * 实时查看模型加载状态（未运行 / 加载中 / 已就绪 / 出错）与 server.log
 
 开发期可用的隐藏参数（打包成 exe 后无控制台，仅供调试）：
-  python launcher.py --selftest        自检：配置读写、端口探测、进程查找、日志读取
-  python launcher.py --start 7860      用命令行方式启动服务（验证用）
-  python launcher.py --stop 7860       用命令行方式停止服务
-  python launcher.py --snap out.png    渲染窗口并截图（验证 UI 用）
+  python src/launcher.py --selftest         自检：配置读写、端口探测、进程查找、日志读取
+  python src/launcher.py --start 7860       用命令行方式启动服务（验证用）
+  python src/launcher.py --stop 7860        用命令行方式停止服务
+  python src/launcher.py --snap out.png     渲染窗口并截图（验证 UI 用）
+
+路径约定：本文件在 `src/` 下，但 `BASE_DIR` 指向**项目根**（`config.ini` / `server.log` /
+`启动器.exe` 都在项目根），服务入口为 `src/main.py`。
 """
 from __future__ import annotations
 
@@ -31,11 +34,12 @@ from tkinter import ttk
 # ---------------------------------------------------------------- 基础路径
 
 IS_FROZEN = bool(getattr(sys, "frozen", False))
+# BASE_DIR 恒为「项目根」：打包后 exe 就在项目根；源码运行时本文件在 src/ 下，要取上一级。
 BASE_DIR = (Path(sys.executable).resolve().parent if IS_FROZEN
-            else Path(__file__).resolve().parent)
+            else Path(__file__).resolve().parent.parent)
 CONFIG_FILE = BASE_DIR / "config.ini"
 LOG_FILE = BASE_DIR / "server.log"
-APP_FILE = BASE_DIR / "app.py"
+APP_FILE = BASE_DIR / "src" / "main.py"
 VENV_PY = BASE_DIR.parent / "VLX-Seek" / ".venv" / "Scripts" / "python.exe"
 
 DEFAULT_PORT = "7860"
@@ -208,7 +212,7 @@ def read_log_tail(max_lines: int = 150, max_bytes: int = 200_000) -> tuple[list[
 # ---------------------------------------------------------------- 服务控制
 
 class ServiceController:
-    """负责拉起 / 停止 app.py，并记录是否由自己启动的进程。"""
+    """负责拉起 / 停止 `src/main.py`，并记录是否由自己启动的进程。"""
 
     def __init__(self) -> None:
         self.proc: subprocess.Popen | None = None
@@ -227,7 +231,7 @@ class ServiceController:
             return False, (f"未找到 VLX-Seek 虚拟环境：\n{VENV_PY}\n\n"
                            "请先按 VLX-Seek 的《使用教程.md》创建 .venv 并安装依赖。")
         if not APP_FILE.exists():
-            return False, f"未找到 app.py：\n{APP_FILE}"
+            return False, f"未找到服务入口 src/main.py：\n{APP_FILE}"
         if self.alive():
             return False, f"服务已在运行（PID {self.proc.pid}）"
         if port_open(host, port):
@@ -257,7 +261,7 @@ class ServiceController:
 
         try:
             self.proc = subprocess.Popen(
-                [str(VENV_PY), "app.py"],
+                [str(VENV_PY), str(APP_FILE)],
                 cwd=str(BASE_DIR),
                 env=env,
                 stdout=handle,
