@@ -1,0 +1,9 @@
+# 换行符策略：.bat / .ini 必须 CRLF（cmd 解析依赖），其余文本统一 LF
+*      text=auto eol=lf
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ini  text eol=crlf
+
+# 二进制资源，禁止换行转换
+*.png binary
+*.ico binary

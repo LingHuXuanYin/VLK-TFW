@@ -1,0 +1,25 @@
+# 日志与运行产物
+server.log
+*.log
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 构建产物（由 launcher.py 经 build_launcher.bat 打包生成）
+启动器.exe
+dist/
+build/
+*.spec
+
+# 运行时数据：上传图 + 候选框缓存（后端启动时会自动重建目录）
+data/
+
+# 环境与临时文件
+.env
+__pycache__/
+.venv/
+venv/
+.DS_Store
+Thumbs.db

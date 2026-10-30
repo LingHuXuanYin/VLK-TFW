@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Taozi VLX · VLX-Seek 七任务接口调测台</title>
+<link rel="stylesheet" href="/assets/style.css" />
+</head>
+<body>
+<header class="app-header">
+  <div class="brand">
+    <div class="logo">VLX</div>
+    <div class="brand-text">
+      <h1>Taozi VLX 调测台</h1>
+      <p>VLX-Seek 1.5-10B · 七种任务接口逐项调测</p>
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="model-pill" id="modelPill" title="模型状态">
+      <span class="dot" id="modelDot"></span>
+      <span id="modelText">连接中…</span>
+    </div>
+    <div class="device-chip" id="deviceChip">device —</div>
+    <button class="btn ghost small" id="reloadBtn">重新加载模型</button>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="rail">
+    <div class="rail-title">任务分组</div>
+    <nav id="nav"><!-- 由 web/render/nav.js 渲染 --></nav>
+    <div class="rail-foot">
+      <div class="hint">
+        <strong>提示</strong>
+        <span>七个任务共用同一模型，差别只在提示词模板。切换任务不会重新加载模型。</span>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <!-- ============ 图像与候选框 ============ -->
+    <section class="card image-card">
+      <div class="card-head">
+        <div>
+          <h2>输入图像</h2>
+          <p class="muted" id="imageMeta">未加载图像</p>
+        </div>
+        <div class="flex gap8">
+          <button class="btn ghost small" id="demoBtn">示例图</button>
+          <button class="btn ghost small" id="uploadBtn">上传图片</button>
+        </div>
+      </div>
+
+      <div class="dropzone" id="dropzone">
+        <canvas id="canvas"></canvas>
+        <div class="empty" id="emptyState">
+          <div class="empty-icon">＋</div>
+          <p>拖拽图片到这里，或点击「上传图片」</p>
+          <p class="muted small">坐标以落盘图为准，长边超过 1280px 会自动等比缩放</p>
+        </div>
+      </div>
+
+      <div class="box-toolbar">
+        <div class="flex gap8 wrap">
+          <button class="btn primary small" id="proposalBtn" disabled>生成候选框 (WeDetect)</button>
+          <button class="btn ghost small" id="clearBoxesBtn" disabled>清空候选框</button>
+          <label class="switch">
+            <input type="checkbox" id="toggleBoxes" checked disabled />
+            <span>显示候选框</span>
+          </label>
+        </div>
+        <div class="box-stat" id="boxStat">候选框 0 个</div>
+      </div>
+
+      <div class="selected-bar" id="selectedBar">
+        <span class="muted small">已选区域：</span>
+        <span id="selectedIndexes" class="muted small">无</span>
+      </div>
+
+      <details class="paste-box">
+        <summary>手动传入候选框 JSON</summary>
+        <textarea id="bboxInput" spellcheck="false" placeholder='[[100,50,300,250],[350,100,490,300]]'></textarea>
+        <div class="flex gap8" style="margin-top:8px">
+          <button class="btn ghost small" id="applyBboxBtn">应用这组框</button>
+          <span class="muted small">格式：[x1, y1, x2, y2] 原图像素，建议 ≤100 个</span>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============ 参数与运行 ============ -->
+    <section class="card form-card">
+      <div class="card-head">
+        <div>
+          <h2 id="taskTitle">任务</h2>
+          <p class="muted" id="taskSummary"></p>
+        </div>
+        <span class="badge" id="taskBadge"></span>
+      </div>
+
+      <div id="formBody"><!-- 由 web/render/form.js 渲染 --></div>
+
+      <div class="run-row">
+        <button class="btn primary" id="runBtn">运行该任务</button>
+        <span class="run-status" id="runStatus"></span>
+      </div>
+    </section>
+
+    <!-- ============ 结果 ============ -->
+    <section class="card result-card" id="resultCard">
+      <div class="card-head">
+        <div>
+          <h2>调测结果</h2>
+          <p class="muted" id="resultSubtitle">尚未运行</p>
+        </div>
+        <div class="tabs" id="resultTabs">
+          <button class="tab active" data-tab="answer">答案</button>
+          <button class="tab" data-tab="boxes">候选框结果</button>
+          <button class="tab" data-tab="prompt">提示词</button>
+          <button class="tab" data-tab="raw">原始 JSON</button>
+        </div>
+      </div>
+
+      <div class="stats" id="stats"></div>
+      <div class="warnings" id="warnings"></div>
+
+      <div class="tab-panel" data-panel="answer" id="panelAnswer">
+        <div class="answer-box"><span class="muted">运行后在此显示模型原始回复。</span></div>
+      </div>
+      <div class="tab-panel hidden" data-panel="boxes">
+        <div class="table-wrap"><table class="box-table" id="boxTable"></table></div>
+      </div>
+      <div class="tab-panel hidden" data-panel="prompt">
+        <div class="code-box" id="promptBox"></div>
+      </div>
+      <div class="tab-panel hidden" data-panel="raw">
+        <div class="code-box" id="rawBox"></div>
+      </div>
+    </section>
+
+    <!-- ============ 一键全量调测 ============ -->
+    <section class="card suite-card" id="suiteCard">
+      <div class="card-head">
+        <div>
+          <h2>一键全量调测</h2>
+          <p class="muted">按文档顺序串行跑完 7 个任务，模型只加载一次；区域任务默认取第 0 个候选框。</p>
+        </div>
+        <button class="btn primary" id="suiteBtn">跑完 7 个任务</button>
+      </div>
+      <div class="table-wrap">
+        <table class="suite-table" id="suiteTable"></table>
+      </div>
+      <div class="suite-foot" id="suiteFoot"></div>
+    </section>
+  </main>
+</div>
+
+<input type="file" id="fileInput" accept="image/*" hidden />
+<div class="toast" id="toast"></div>
+
+<!-- ES module：main.js 从 features/ 与 shared/ 相对导入，三者由后端同级挂载 -->
+<script type="module" src="/assets/main.js"></script>
+</body>
+</html>
