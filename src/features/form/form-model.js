@@ -68,16 +68,18 @@ export function parseRegionIndexes(raw) {
  * @param {string|null} input.imageId
  * @param {number[][]} input.boxes 画布上的候选框（空数组表示不传，后端自动生成）
  * @param {number[]} input.regionIndexes 区域任务的索引
+ * @param {number[][]|null} [input.roi] 电子围栏多边形；null 表示不限区域
  * @returns {import("../../shared/contracts.js").RunPayload}
  * 边界：区域任务的 text 恒为空串（提示词由索引拼 `<objN>`）；其余任务取表单内容。
  */
-export function buildRunPayload({ task, form, imageId, boxes, regionIndexes }) {
+export function buildRunPayload({ task, form, imageId, boxes, regionIndexes, roi = null }) {
   const needsIndex = Boolean(task.needs_index);
   return {
     image_id: imageId,
     text: needsIndex ? "" : String(form.text ?? ""),
     lang: form.lang,
     bbox_list: boxes && boxes.length ? boxes : null,
+    roi: roi && roi.length ? roi : null,
     auto_proposals: true,
     target_region_indexes: needsIndex ? regionIndexes : null,
     max_new_tokens: form.max_new_tokens,

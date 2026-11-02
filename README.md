@@ -62,7 +62,8 @@
 | 左侧任务导航 | 按文档分成 **开放问答 / 检测与定位 / 区域理解** 三组，另有「一键全量调测」。跑过的任务会打绿点 |
 | 输入图像 | 拖拽或上传；长边超过 1280 会自动等比缩放（文档建议），坐标以缩放后的落盘图为准 |
 | 候选框工具条 | 生成 WeDetect 候选框（100 个，结果按图缓存）、清空、显示/隐藏、手动粘贴 JSON |
-| 画布 | 半透明细线为候选框，鼠标悬停高亮并显示 `objN`；**点击=选中/取消**，选中框为蓝色实心标签。多个框重叠时优先命中面积最小的那个 |
+| 电子围栏 | 「矩形围栏」拖拽、「多边形围栏」逐点拾取。画好后候选框**只在围栏内**生成，送模型时围栏外像素灰化 |
+| 画布 | 半透明细线为候选框，鼠标悬停高亮并显示 `objN`；**点击=选中/取消**，选中框为蓝色实心标签。多个框重叠时优先命中面积最小的那个。青色虚线为电子围栏 |
 | 参数面板 | 每个任务的提示词模板、对应 Python 调用、`text`/`lang`/`max_new_tokens`/`temperature`/`top_p`，以及该任务已知的坑 |
 | 调测结果 | 答案（`<ground>/<objects>/<think>/<answer>` 分色高亮）、统计（耗时/tokens/返回框数/候选框来源）、候选框结果表格、模板实际填充后的提示词、原始 JSON |
 | 一键全量调测 | 串行跑完 7 个任务，表格逐行显示状态/tokens/耗时/答案摘要，点行可回看单任务详情 |
@@ -86,6 +87,7 @@
 说明：
 
 - 候选框不传时，后端按文档路线 A 自动用 WeDetect 生成 100 个；生成结果按图片缓存，后续任务直接复用（`boxes_source` 会显示 `request` / `wedetect` / `wedetect-cache`）。
+- 画了电子围栏时，候选框只在围栏内生成与保留，模型看到的也是围栏外灰化的图；不画则与旧行为完全一致。
 - 区域任务的索引来自画布点选，也支持在输入框里手填 `0, 2`。
 - 一键全量调测时区域任务默认取 `[0]`，可在单任务面板里改写后再单独跑。
 
@@ -99,7 +101,7 @@
 | POST | `/api/images` | 上传图片（multipart `file`） |
 | GET | `/api/images/{id}` | 取图 |
 | GET | `/api/demo` | 载入 VLX-Seek 示例图 |
-| POST | `/api/proposals` | 生成/读取 WeDetect 候选框，`{"image_id": "...", "force": false}` |
+| POST | `/api/proposals` | 生成/读取 WeDetect 候选框，`{"image_id": "...", "force": false, "roi": null}` |
 | POST | `/api/tasks/{task}/run` | 跑单个任务 |
 | POST | `/api/suite/run` | 串行跑完 7 个任务 |
 
@@ -111,6 +113,7 @@
   "text": "orange; apple",
   "lang": "zh",
   "bbox_list": null,
+  "roi": null,
   "auto_proposals": true,
   "target_region_indexes": null,
   "max_new_tokens": 1024,
@@ -119,7 +122,32 @@
 }
 ```
 
-返回体在 worker 原始字段（`answer` / `result_bbox_list` / `prompt_tokens` / `completion_tokens`）之外，补充了 `elapsed_ms`、`prompt`（模板实际填充结果）、`boxes_source`、`warnings`，方便排查。
+`roi` 为电子围栏多边形 `[[x, y], ...]`（原图像素，≥3 个顶点）；`null` 表示整图。返回体在 worker 原始字段（`answer` / `result_bbox_list` / `prompt_tokens` / `completion_tokens`）之外，补充了 `elapsed_ms`、`prompt`（模板实际填充结果）、`boxes_source`、`boxes_count`、`fence_applied`、`fence_vertices`、`fence_cropped`、`warnings`，方便排查。
+
+### 4.1 电子围栏（ROI）
+
+围栏不是靠提示词约束的，而是把两段链路同时收窄：
+
+| 阶段 | 做法 | 效果 |
+|---|---|---|
+| 候选框 | 只裁围栏外接矩形（外扩 8px）送 WeDetect，坐标加回 offset，再按围栏过滤 | 围栏内分辨率更高，100 个额度不被围栏外的大目标吃掉 |
+| 识别 | 围栏外填中灰 `(128,128,128)`，**尺寸不变** | 模型物理上看不见围栏外；坐标体系零变动 |
+
+真正的兜底在模型结构上：`result_bbox_list` 的坐标直接取自调用方传入的候选框（`vlx_seek_worker.py` 里 `caller_boxes[object_index]`），模型只能输出 `<objects>0,2</objects>` 这类索引，**报不出围栏外的框**——没有可引用的编号。
+
+过滤规则（取并集，宁可多留）：框与围栏的交集面积 ≥ 框面积 50%，**或**框中心点在围栏内。
+
+缓存按围栏指纹分文件（`{id}.boxes.{key}.json`），同一张图画不同围栏各存一份；换围栏不会串用旧结果，整图那份也保留。
+
+围栏占比过小（< 整图 0.5% 或边长 < 64px）时自动退回整图推理后再过滤，避免把一小块噪声放大成模型输入。
+
+实测（RTX 3090，`demo_image.jpg` 500×399，围栏取画面左侧 50%×70%）：
+
+```
+整图            100 框，其中落在围栏内的只有 48 个
+围栏裁剪推理     80 框，全部在围栏内（越界 0 个）
+换一个围栏       90 框，与前一围栏结果不同，越界 0 个
+```
 
 ---
 
@@ -176,8 +204,9 @@ Taozi-VLX-deepseek/
 │   │   ├── schemas.py          # pydantic 请求模型 + ImageMeta/ModelStatus 契约
 │   │   ├── errors.py           # ApiError：services 不依赖 fastapi 的关键
 │   │   ├── protocols/          # ImageStore / ProposalSource / VisionWorker+WorkerProvider / TaskRunner
-│   │   ├── services/           # task_catalog 元数据、image_store、wedetect_source、
-│   │   │                       # model_runtime 状态机、task_runner 派发、suite_runner 编排
+│   │   ├── services/           # task_catalog 元数据、image_store、fence（围栏几何）、
+│   │   │                       # wedetect_source 候选框、model_runtime 状态机、
+│   │   │                       # task_runner 派发、suite_runner 编排
 │   │   ├── deps.py             # 组装根：单例在此创建，路由用 Depends 取
 │   │   ├── routers/            # meta / status / images / proposals / tasks
 │   │   └── main.py             # 应用组装：lifespan、异常翻译、静态挂载、路由注册
@@ -187,16 +216,18 @@ Taozi-VLX-deepseek/
 │   │   ├── task/task-catalog.js# 分组 / 序号 / 模板取值
 │   │   ├── form/form-model.js  # 默认值 / 持久化合并 / 请求体构造 / 索引解析 / 校验
 │   │   ├── bbox/bbox-geometry.js # 坐标映射 / 命中测试 / 配色 / 粘贴 JSON 校验 / 画布尺寸
+│   │   ├── fence/fence-geometry.js # 围栏：矩形转多边形 / 顶点规整 / 面积 / 点在多边形内
 │   │   └── suite/suite-summary.js# 全量结果统计与答案摘要
 │   ├── web/                    # Web UI：持有状态、渲染 DOM、操作画布
-│   │   ├── index.html          # 结构与元素 id（41 个）
+│   │   ├── index.html          # 结构与元素 id（46 个）
 │   │   ├── style.css
 │   │   ├── main.js             # 状态 + 事件绑定 + 编排
 │   │   ├── storage.js          # localStorage 读写
 │   │   ├── dom.js              # $ / esc
-│   │   ├── canvas/annotator.js # 画布绘制与点选
+│   │   ├── canvas/annotator.js # 画布绘制与点选（候选框 + 围栏）
+│   │   ├── canvas/fence-editor.js # 围栏绘制交互（矩形拖拽 / 多边形拾取）
 │   │   └── render/             # nav / form / result / suite 四块渲染
-│   └── shared/contracts.js     # JSDoc 契约（TaskMeta/TaskResult/...）+ PALETTE/存储键
+│   └── shared/contracts.js     # JSDoc 契约（TaskMeta/Fence/TaskResult/...）+ PALETTE/存储键
 ├── 启动器.exe                  # 桌面启动器（双击用；改完 src/launcher.py 用 build_launcher.bat 重打包）
 ├── build_launcher.bat          # 重新打包启动器（PyInstaller 入口 src/launcher.py）
 ├── _env.bat                    # run.bat / debug.bat 共用的环境变量与端口解析（导出 VLX_ENTRY）

@@ -114,3 +114,80 @@
 2. **未在真实 cmd 里跑一次 `run.bat`**：本机安全策略禁止从工具调用 `cmd.exe`，bat 只做了静态校验（编码、CRLF、替换命中、路径展开存在性），未实测进程拉起。首次使用请手动跑一次 `run.bat`。
 3. **未新增 `docs/deployment.md`**：本项目部署面就是「venv + 四个 bat + 启动器」，README 的「快速开始 / 1.1 启动器」两节已覆盖全部步骤与命令，另建文档会与 README 重复；若后续引入服务化部署再补。
 4. `assets/` 未迁入 `src/`：它是 PyInstaller 构建资源（图标），不是运行时代码；迁入会让 `--icon` 变成 `src\assets\...` 而收益为零。
+
+---
+
+## 2026-10-31 · 电子围栏：只对 ROI 生成候选框与识别
+
+### 涉及模块
+
+| 组 | 文件 | 性质 |
+|---|---|---|
+| backend | `services/fence.py` | 新增，围栏几何唯一实现 |
+| backend | `services/wedetect_source.py`、`services/task_runner.py`、`services/suite_runner.py`、`services/image_store.py` | 改 |
+| backend | `protocols/proposal_source.py`、`protocols/image_store.py`、`schemas.py`、`routers/proposals.py` | 改（契约） |
+| features | `features/fence/fence-geometry.js` | 新增，前端几何 |
+| features | `features/form/form-model.js`、`features/api/vlx-api.js` | 改（请求体与端点参数） |
+| web | `web/canvas/fence-editor.js` | 新增，绘制交互 |
+| web | `web/canvas/annotator.js`、`web/main.js`、`web/index.html`、`web/style.css`、`web/render/result.js` | 改 |
+| shared | `shared/contracts.js` | 改（`Fence` 类型 + 常量） |
+
+### 变更摘要
+
+围栏不是靠提示词约束实现的，而是把两段链路同时收窄：
+
+1. **候选框段**：`wedetect_source._generate` 收到围栏时先裁外接矩形（外扩 8px）再推理，出框后把坐标加回 offset，最后按围栏过滤。围栏内分辨率更高，100 个候选框额度不再被围栏外的大目标吃掉。
+2. **识别段**：`task_runner.run` 在派发前把围栏外像素填成中灰 `(128,128,128)`，**尺寸不变**。模型物理上看不见围栏外内容，而坐标体系零变动、不需要任何映射。
+
+兜底来自模型结构：`result_bbox_list` 的坐标直接取自传入的候选框（`caller_boxes[object_index]`），模型只能输出 `<objects>0,2</objects>` 这类索引，报不出围栏外没有编号的框。
+
+配套细节：
+
+- 几何全部收在 `services/fence.py`：多边形归一化（夹边、2px 去重、面积下限）、外接矩形、鞋带面积、Sutherland–Hodgman 求框与围栏的交集面积、点在多边形内、灰化。
+- 过滤规则取并集：交集面积 ≥ 框面积 50% **或** 框中心点在围栏内。单看中心点会漏掉「贴边大框」，单看占比会漏掉「框很大但主体在内」。
+- 候选框缓存键加围栏指纹（`{id}.boxes.{key}.json`）。这是必须改的：否则「先跑整图、再画围栏」会命中整图那份缓存，表现为围栏完全没生效。整图那份文件名不变，向后兼容。
+- 围栏过小（面积 < 整图 0.5% 或任一边 < 64px）时退回整图推理再过滤，避免把一小块噪声放大成模型输入尺寸。
+- 显式传入的 `bbox_list` 同样过围栏过滤，保证「只看围栏内」语义一致。
+- 前端新增矩形拖拽与多边形拾取两种画法；围栏以青色虚线画在候选框**下面**（半透明填充不糊住框线）；画完后清空旧候选框，避免整图的框与围栏的框混在一起误导。
+- 绘制器的事件绑在 canvas 的**捕获阶段**并 `stopPropagation`：否则画围栏时的按下/抬起会被祖先 `dropzone` 的 click 当成候选框点选。
+
+### 影响面
+
+- **默认行为不变**：`roi` 为 `null` 时，候选框生成、缓存文件名、识别图、`boxes_source` 取值全部与旧版一致。新增的 3 个结果字段（`fence_applied` / `fence_vertices` / `fence_cropped`）在旧请求下分别是 `false` / `0` / `false`。
+- **HTTP 接口**：3 个请求模型新增可选字段 `roi`，不传即旧行为；`/api/proposals` 的响应多返回 `fence_applied` 与 `cropped`。
+- **磁盘**：`data/images/` 新增 `{id}.boxes.{key}.json` 一种文件，仍是可随时删除的缓存。
+- **不动的东西**：任务元数据、提示词模板、七个任务的派发方式、`task_catalog.py`、启动链路、`.bat`、`localStorage` 键。
+
+### 自测结论
+
+后端（VLX-Seek venv）：
+
+- 几何 26 项断言全过：夹边归一化、2px 去重、首尾闭合点剔除、面积/逆序面积、`pad=8` 外接矩形、边上与顶点算在内、半外框 `ratio=0.25`、全内 `1.0`、全外 `0.0`、灰化像素与尺寸。
+- 行为 23 项断言全过（假模型 + 假 worker）：裁剪框坐标 `(2,2,158,158)`、子图坐标加 offset 后回填正确、同围栏命中缓存、换围栏不复用、三个围栏生成三份缓存文件、围栏内无框时返回空、显式框被过滤、灰化生效且尺寸不变、无围栏时不灰化、`vqa` 也灰化、围栏内无框报 400、非法围栏报 400、围栏内框过少时给警告。
+- **真实模型验证**（`demo_image.jpg` 500×399）：整图 100 框，其中只有 48 个落在围栏内；围栏裁剪推理后 80 框且越界 0 个；换一个围栏得到 90 框且与前一围栏结果不同、越界 0 个；二次请求命中缓存；灰化后围栏外为 `(128,128,128)`、围栏内保持原色、尺寸不变。这组数据直接印证了「整图模式下围栏内召回归属被抢」的假设。
+- 契约：`/openapi.json` 里三个请求模型均含 `roi`；9 个 `/api/*` 端点齐全；`/api/meta` 仍是 7 任务 3 组；非法 `roi` 类型由 pydantic 拦为 422。
+- 静态：`/features/fence/fence-geometry.js` 与 `/assets/canvas/fence-editor.js` 均 200。
+
+前端：
+
+- 17 个 JS 文件语法全绿（node `--check`）。
+- 29 条相对 import 零缺失；`features/` 无 `document`/`window`/`localStorage`/`canvas.` 越界。
+- 几何纯函数 25 项断言全过（矩形乱序角点、闭合尾点、越界夹取、面积下限、包围盒、顶点吸附、`describeFence`、请求体透传）；凹多边形内外判定另 6 项全过，面积 `9400 = 10000 − 30×20` 与手算一致。
+- DOM id：HTML 46 个，JS 引用 50 个，缺的 7 个全是表单与 chips 动态生成（与上一轮结论一致），新增的 5 个围栏 id 全部静态存在。
+- 新增模块均被上一级引用（`fence-geometry` ← `fence-editor` ← `main`），无死代码。
+
+浏览器人工回归（2026-11-02，实机跑 `debug.bat` 起的服务，用户确认通过）：
+
+- 画矩形围栏 → 生成候选框，框只出现在围栏内；再跑 `detection`，结果框全部落在围栏内。
+- 换多边形围栏 → 候选框重新按新围栏生成，未复用上一份缓存。
+- 清除围栏 → 回到整图行为，候选框恢复全图生成。
+- 画围栏过程中点画布不触发候选框点选（捕获阶段 `stopPropagation` + `suppressClick` 生效）。
+
+这一轮把上一版遗留的「未做真实浏览器点击回归」闭环。
+
+### 遗留项（明确未做）
+
+1. **围栏不持久化**：换图或刷新即清空。坐标强绑定单张图，存进 `localStorage` 反而容易把旧图围栏套到新图上。
+2. **只支持单围栏**：多个围栏同时生效、反向围栏（只检测围栏外）均未做。
+3. **围栏不可编辑**：画歪了只能清除重画，没有顶点拖拽。
+4. **`num_proposals` 仍是固定 100**：围栏提升的是「围栏内分到多少额度」，不是总额度上限。要放开上限需把它提成配置项（上一轮讨论过的第二个可选项），本轮未做。

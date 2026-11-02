@@ -72,6 +72,16 @@
         <div class="box-stat" id="boxStat">候选框 0 个</div>
       </div>
 
+      <div class="fence-toolbar">
+        <div class="flex gap8 wrap">
+          <button class="btn ghost small" id="fenceRectBtn" disabled>矩形围栏</button>
+          <button class="btn ghost small" id="fencePolyBtn" disabled>多边形围栏</button>
+          <button class="btn ghost small" id="fenceClearBtn" disabled>清除围栏</button>
+        </div>
+        <div class="box-stat" id="fenceStat">围栏：未设置</div>
+      </div>
+      <p class="fence-hint" id="fenceHint">画好围栏后：候选框只在围栏内生成，送模型时围栏外像素灰化。多边形逐点点击，点首点 / 双击 / 回车闭合，Esc 取消。</p>
+
       <div class="selected-bar" id="selectedBar">
         <span class="muted small">已选区域：</span>
         <span id="selectedIndexes" class="muted small">无</span>

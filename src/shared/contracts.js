@@ -48,12 +48,20 @@
  */
 
 /**
+ * 电子围栏：一组原图像素顶点（首尾自动闭合）。
+ * @typedef {number[][]} Fence
+ *   `[[x, y], ...]`，至少 3 个顶点。矩形也用它表达（4 个顶点）。
+ *   与候选框同坐标系：以落盘图（长边 ≤1280）为准。
+ */
+
+/**
  * 单任务运行请求体。
  * @typedef {Object} RunPayload
  * @property {string} image_id
  * @property {string} text
  * @property {"en"|"zh"} lang
  * @property {number[][]|null} bbox_list
+ * @property {Fence|null} roi 电子围栏，null 表示整图
  * @property {boolean} auto_proposals
  * @property {number[]|null} target_region_indexes
  * @property {number} max_new_tokens
@@ -91,6 +99,9 @@
  * @property {number} [top_p]
  * @property {string} [boxes_source]    request | wedetect | wedetect-cache | none
  * @property {number} [boxes_count]
+ * @property {boolean} [fence_applied]  本次是否启用电子围栏
+ * @property {number} [fence_vertices]  围栏顶点数
+ * @property {boolean} [fence_cropped]  候选框是否在围栏裁剪出的子图上推理
  * @property {number[]|null} [target_region_indexes]
  * @property {string[]} [warnings]
  * @property {string} [error]
@@ -131,6 +142,12 @@ export const PALETTE = [
 
 /** 表单持久化的 localStorage 键。改键名等于丢弃用户已存的参数。 */
 export const FORM_STORE_KEY = "taozi-vlx-forms-v1";
+
+/** 电子围栏描边色。刻意避开 PALETTE，别和结果框标签色混。 */
+export const FENCE_COLOR = "#00d0ff";
+
+/** 围栏最少顶点数，与后端 `fence.normalize` 的校验一致。 */
+export const MIN_FENCE_VERTICES = 3;
 
 /** top_p 默认值：任务目录里没有 default_top_p，统一取 1.0（等价不截断）。 */
 export const DEFAULT_TOP_P = 1.0;

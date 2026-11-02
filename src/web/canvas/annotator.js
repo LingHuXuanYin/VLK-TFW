@@ -1,10 +1,14 @@
 /**
- * 画布渲染与点选（web 组）：候选框细线、悬停高亮、选中填充、结果框标注。
+ * 画布渲染与点选（web 组）：候选框细线、悬停高亮、选中填充、结果框标注、电子围栏。
  *
  * 只负责「把当前视图状态画出来」和「告诉我点到哪个框」；
- * 谁选中了哪个框由 `main.js` 决定。几何计算全部来自 `features/bbox/bbox-geometry.js`。
+ * 谁选中了哪个框由 `main.js` 决定。几何计算全部来自 `features/bbox/bbox-geometry.js`
+ * 与 `features/fence/fence-geometry.js`。
  */
 import { colorForLabel, collectLabels, fitCanvas, hitTest, toImageCoords } from "../../features/bbox/bbox-geometry.js";
+
+/** 围栏描边色。刻意不用 PALETTE 里的颜色，避免和结果框标签色混淆。 */
+const FENCE_COLOR = "#00d0ff";
 
 /**
  * 创建画布控制器。
@@ -16,7 +20,12 @@ import { colorForLabel, collectLabels, fitCanvas, hitTest, toImageCoords } from 
  *   setSelected: (indexes: number[]) => void,
  *   setShowBoxes: (show: boolean) => void,
  *   setResult: (result: object|null) => void,
+ *   setFence: (points: number[][]|null) => void,
+ *   setFenceDraft: (points: number[][]|null) => void,
+ *   getFence: () => number[][],
  *   hitTestEvent: (event: MouseEvent) => number,
+ *   toImagePoint: (event: MouseEvent) => {x: number, y: number}|null,
+ *   naturalSize: () => {width: number, height: number}|null,
  *   updateHover: (event: MouseEvent) => {changed: boolean, index: number},
  *   clearHover: () => boolean,
  *   redraw: () => void,
@@ -25,7 +34,16 @@ import { colorForLabel, collectLabels, fitCanvas, hitTest, toImageCoords } from 
  * }}
  */
 export function createAnnotator({ canvas, container, palette }) {
-  const view = { img: null, boxes: [], selected: [], hovered: -1, showBoxes: true, result: null };
+  const view = {
+    img: null,
+    boxes: [],
+    selected: [],
+    hovered: -1,
+    showBoxes: true,
+    result: null,
+    fence: [],
+    fenceDraft: [],
+  };
 
   /**
    * 按容器宽度重算画布像素尺寸（含 DPR），图片未就绪时不做任何事。
@@ -59,6 +77,9 @@ export function createAnnotator({ canvas, container, palette }) {
     const s = canvas.width / img.naturalWidth;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+    // 围栏画在候选框下面：半透明填充不会糊住框线
+    drawFence(ctx, s);
 
     if (view.showBoxes) {
       ctx.font = `${10 * s}px ui-monospace, Consolas, monospace`;
@@ -115,6 +136,50 @@ export function createAnnotator({ canvas, container, palette }) {
   }
 
   /**
+   * 画电子围栏：半透明填充 + 虚线边 + 顶点圆点（仅草稿态画圆点）。
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {number} s 原图 → 画布像素的缩放比
+   * 边界：1~2 个点只画折线不闭合，≥3 点才闭合填充。
+   */
+  function drawFence(ctx, s) {
+    const isDraft = view.fenceDraft.length > 0;
+    const points = isDraft ? view.fenceDraft : view.fence;
+    if (!points || !points.length) return;
+
+    ctx.save();
+    ctx.beginPath();
+    points.forEach((point, index) => {
+      const x = point[0] * s;
+      const y = point[1] * s;
+      if (index === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    if (points.length >= 3) {
+      ctx.closePath();
+      ctx.fillStyle = "rgba(0,208,255,.10)";
+      ctx.fill();
+    }
+    ctx.setLineDash([7 * s, 5 * s]);
+    ctx.lineWidth = 2 * s;
+    ctx.strokeStyle = FENCE_COLOR;
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    if (isDraft) {
+      points.forEach((point) => {
+        ctx.beginPath();
+        ctx.arc(point[0] * s, point[1] * s, 3.5 * s, 0, Math.PI * 2);
+        ctx.fillStyle = "#fff";
+        ctx.fill();
+        ctx.lineWidth = 1.5 * s;
+        ctx.strokeStyle = FENCE_COLOR;
+        ctx.stroke();
+      });
+    }
+    ctx.restore();
+  }
+
+  /**
    * 把鼠标事件换算成原图坐标后做命中测试。
    * @returns {number} 索引，未命中 -1；图片未就绪恒 -1
    */
@@ -152,7 +217,32 @@ export function createAnnotator({ canvas, container, palette }) {
       view.result = result;
       draw();
     },
+    /** 设置已确认的围栏；传 null 或空数组清除。 */
+    setFence(points) {
+      view.fence = points || [];
+      view.fenceDraft = [];
+      draw();
+    },
+    /** 设置绘制中的草稿（拖动矩形 / 多边形未闭合时的实时预览）。 */
+    setFenceDraft(points) {
+      view.fenceDraft = points || [];
+      draw();
+    },
+    getFence: () => view.fence,
     hitTestEvent,
+    /** 鼠标事件 → 原图像素坐标；图片未就绪返回 null。 */
+    toImagePoint(event) {
+      const img = view.img;
+      if (!img) return null;
+      return toImageCoords(
+        { x: event.clientX, y: event.clientY },
+        canvas.getBoundingClientRect(),
+        { width: img.naturalWidth, height: img.naturalHeight }
+      );
+    },
+    /** 图片原始尺寸；未就绪返回 null。 */
+    naturalSize: () =>
+      view.img ? { width: view.img.naturalWidth, height: view.img.naturalHeight } : null,
     /** 悬停变化时才重绘；返回是否变化与当前索引。 */
     updateHover(event) {
       const index = hitTestEvent(event);

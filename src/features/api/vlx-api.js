@@ -46,9 +46,13 @@ export function createVlxApi({ http }) {
 
     /**
      * 取候选框；`force=true` 忽略磁盘缓存。
-     * @returns {Promise<{boxes: number[][], source: "cache"|"wedetect", count: number, elapsed_ms?: number}>}
+     * @param {string} imageId
+     * @param {boolean} [force]
+     * @param {number[][]|null} [roi] 电子围栏多边形；传了只在该区域内出框
+     * @returns {Promise<{boxes: number[][], source: "cache"|"wedetect", count: number, elapsed_ms?: number, cropped?: boolean}>}
      */
-    getProposals: (imageId, force = false) => http.postJson("/api/proposals", { image_id: imageId, force }),
+    getProposals: (imageId, force = false, roi = null) =>
+      http.postJson("/api/proposals", { image_id: imageId, force, roi }),
 
     /**
      * 跑单个任务。

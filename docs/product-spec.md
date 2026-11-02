@@ -9,12 +9,13 @@
 2. 右上角状态从「模型加载中…」变成「模型就绪 · 28.4s」后，按钮才会解除禁用。
 3. 左上「示例图」载入 `demo_image.jpg`，或拖一张图进画布。
 4. 「生成候选框 (WeDetect)」→ 画布上出现 100 个半透明细框，鼠标悬停显示 `objN`。
-5. 左侧导航选任务，右侧改 `text` / `lang` / `max_new_tokens`，点「运行该任务」。
-6. 结果区四个面板：**答案**（标签分色）、**候选框结果**（表格）、**提示词**（模板实际填充后）、**原始 JSON**。
-7. 区域任务（`brief_region_caption` / `region_ocr`）先在画布上点选框，索引会自动填进输入框。
-8. 「跑完 7 个任务」串行跑全量，表格逐行更新，点任意行回看该任务详情。
+5. 只想看画面某一块：点「矩形围栏」拖一块，或「多边形围栏」逐点点击（点首点 / 双击 / 回车闭合，Backspace 撤销，Esc 取消）。画完候选框会清空，重新点「生成候选框」就只在该区域内出框；送模型时围栏外像素灰化。**不画围栏则一切与旧版一致。**
+6. 左侧导航选任务，右侧改 `text` / `lang` / `max_new_tokens`，点「运行该任务」。
+7. 结果区四个面板：**答案**（标签分色）、**候选框结果**（表格）、**提示词**（模板实际填充后）、**原始 JSON**。
+8. 区域任务（`brief_region_caption` / `region_ocr`）先在画布上点选框，索引会自动填进输入框。
+9. 「跑完 7 个任务」串行跑全量，表格逐行更新，点任意行回看该任务详情。
 
-参数按任务存在 `localStorage`（键 `taozi-vlx-forms-v1`），刷新不丢。
+参数按任务存在 `localStorage`（键 `taozi-vlx-forms-v1`），刷新不丢。围栏**不持久化**：换图或刷新即清空，避免拿上一张图的坐标套到新图上。
 
 ## 2. 代码地图
 
@@ -28,7 +29,7 @@ Taozi-VLX-deepseek/
 │   │   ├── schemas.py            # pydantic 请求模型
 │   │   ├── protocols/            # ImageStore / ProposalSource / WorkerProvider / VisionWorker
 │   │   ├── services/             # task_catalog（元数据）、model_runtime、wedetect_source、
-│   │   │                         # image_store、task_runner、suite_runner
+│   │   │                         # image_store、fence（围栏几何）、task_runner、suite_runner
 │   │   ├── deps.py               # 组装根：单例在此创建，路由通过 Depends 取
 │   │   ├── routers/              # meta / status / images / proposals / tasks
 │   │   └── main.py               # FastAPI 组装：lifespan、静态挂载、include_router
@@ -37,12 +38,14 @@ Taozi-VLX-deepseek/
 │   │   ├── task/                 # task-catalog：分组、序号、模板取值
 │   │   ├── form/                 # form-model：默认值、请求体构造、索引解析
 │   │   ├── bbox/                 # bbox-geometry：命中测试、坐标换算、label 配色
+│   │   ├── fence/                # fence-geometry：矩形转多边形、顶点规整、面积、点在多边形内
 │   │   └── suite/                # suite-summary：全量结果统计
 │   ├── web/
 │   │   ├── index.html / style.css
 │   │   ├── main.js               # 状态持有 + 事件绑定 + 编排
 │   │   ├── storage.js            # localStorage 读写
-│   │   ├── canvas/annotator.js   # 画布绘制与点选
+│   │   ├── canvas/annotator.js   # 画布绘制与点选（候选框 + 围栏）
+│   │   ├── canvas/fence-editor.js# 围栏绘制交互（矩形拖拽 / 多边形拾取）
 │   │   └── render/               # nav / form / result / suite 四块 DOM 渲染
 │   └── shared/contracts.js       # JSDoc 契约 + 常量
 ├── docs/                         # 本目录
@@ -58,6 +61,9 @@ Taozi-VLX-deepseek/
 | 参数校验规则、错误文案 | `src/backend/app/services/task_runner.py` |
 | 模型加载方式、设备选择 | `src/backend/app/services/model_runtime.py` |
 | 候选框生成与缓存 | `src/backend/app/services/wedetect_source.py` |
+| 围栏裁剪/过滤/灰化的几何实现 | `src/backend/app/services/fence.py` |
+| 围栏在画布上的绘制与拾取交互 | `src/web/canvas/fence-editor.js` + `src/web/canvas/annotator.js` |
+| 围栏前端校验（顶点、面积、贴合首点） | `src/features/fence/fence-geometry.js` |
 | 图片缩放与落盘 | `src/backend/app/services/image_store.py` |
 | 新增 HTTP 端点 | `src/backend/app/routers/` 下对应文件 |
 | 服务入口 / 启动参数 | `src/main.py` |
@@ -76,6 +82,7 @@ Taozi-VLX-deepseek/
 - `backend/app/routers/` 里出现 `PIL`、`torch`、`json.dump`，越界：说明业务落到了路由层。
 - 模型对象、锁、磁盘路径只在 `services/` 与 `deps.py` 出现。
 - 拼绝对路径只在 `src/backend/app/config.py` 一处：它导出 `SRC_ROOT`（源码根）与 `PROJECT_ROOT`（项目根），其他文件一律 import 常量。
+- **围栏几何有两份实现**：`backend/app/services/fence.py` 与 `features/fence/fence-geometry.js`。前端负责「画得出、拦得住明显错误」，后端负责「算得准、说了算」。改判定口径（顶点容差 2px、点在多边形边界算在内）必须两边同步，否则会出现前端能画、后端 400 的割裂。
 
 ## 5. 启动与端口
 

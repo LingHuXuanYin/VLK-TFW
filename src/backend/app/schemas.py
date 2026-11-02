@@ -13,12 +13,17 @@ from pydantic import BaseModel
 # 请求模型
 # ---------------------------------------------------------------------------
 class RunRequest(BaseModel):
-    """单任务运行请求。字段含义见 README「HTTP 接口」一节，均为可选（缺省走任务默认值）。"""
+    """单任务运行请求。字段含义见 README「HTTP 接口」一节，均为可选（缺省走任务默认值）。
+
+    `roi` 为电子围栏多边形（原图像素顶点列）。传了它就只在围栏内生成候选框、
+    并把围栏外像素灰化后再送模型；不传则与旧行为完全一致。
+    """
 
     image_id: str
     text: Optional[str] = None
     lang: Optional[str] = None
     bbox_list: Optional[list[list[float]]] = None
+    roi: Optional[list[list[float]]] = None
     auto_proposals: bool = True
     target_region_indexes: Optional[list[int]] = None
     max_new_tokens: Optional[int] = None
@@ -27,10 +32,14 @@ class RunRequest(BaseModel):
 
 
 class ProposalsRequest(BaseModel):
-    """候选框请求。`force=True` 忽略磁盘缓存重新跑 WeDetect。"""
+    """候选框请求。`force=True` 忽略磁盘缓存重新跑 WeDetect。
+
+    `roi` 存在时只裁围栏外接矩形推理，并把围栏外的框过滤掉。
+    """
 
     image_id: str
     force: bool = False
+    roi: Optional[list[list[float]]] = None
 
 
 class SuiteRequest(BaseModel):
@@ -38,6 +47,7 @@ class SuiteRequest(BaseModel):
 
     image_id: str
     bbox_list: Optional[list[list[float]]] = None
+    roi: Optional[list[list[float]]] = None
     auto_proposals: bool = True
     overrides: dict[str, dict[str, Any]] = {}
 

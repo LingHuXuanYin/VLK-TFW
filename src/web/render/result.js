@@ -36,6 +36,12 @@ export function renderResult(res) {
     ["Tokens", `${res.prompt_tokens} → ${res.completion_tokens}`],
     ["返回框", (res.result_bbox_list || []).length],
     ["候选框", `${res.boxes_count}（${res.boxes_source}）`],
+    [
+      "围栏",
+      res.fence_applied
+        ? `${res.fence_vertices} 顶点${res.fence_cropped ? " · 裁剪推理" : " · 整图推理"}`
+        : "未启用",
+    ],
     ["lang", res.lang],
     ["max_new_tokens", res.max_new_tokens],
   ];
@@ -149,6 +155,9 @@ function buildRawView(res) {
       temperature: res.temperature,
       top_p: res.top_p,
       boxes_count: res.boxes_count,
+      fence_applied: res.fence_applied,
+      fence_vertices: res.fence_vertices,
+      fence_cropped: res.fence_cropped,
       target_region_indexes: res.target_region_indexes,
     },
   };

@@ -30,6 +30,7 @@ class DefaultSuiteRunner:
         if not image_id:
             raise ApiError(400, "缺少 image_id。")
         bbox_list = payload.get("bbox_list")
+        roi = payload.get("roi")
         overrides: Mapping[str, Mapping[str, Any]] = payload.get("overrides") or {}
 
         results: list[dict[str, Any]] = []
@@ -38,6 +39,7 @@ class DefaultSuiteRunner:
             task_payload: dict[str, Any] = {
                 "image_id": image_id,
                 "bbox_list": bbox_list,
+                "roi": roi,
                 "auto_proposals": payload.get("auto_proposals", True),
             }
             task_payload.update(overrides.get(task["id"], {}))

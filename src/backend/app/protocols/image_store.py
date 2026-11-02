@@ -46,10 +46,18 @@ class ImageStore(Protocol):
         """图片落盘路径（不校验存在性，供 FileResponse 使用）。"""
         ...
 
-    def load_proposals(self, image_id: str) -> Optional[list[list[float]]]:
-        """读取缓存的候选框；无缓存或缓存损坏返回 None（不抛异常）。"""
+    def load_proposals(
+        self, image_id: str, roi_key: Optional[str] = None
+    ) -> Optional[list[list[float]]]:
+        """读取缓存的候选框；无缓存或缓存损坏返回 None（不抛异常）。
+
+        `roi_key` 为围栏指纹：同一张图在不同围栏下必须各存一份缓存，
+        传空表示整图候选框。
+        """
         ...
 
-    def save_proposals(self, image_id: str, boxes: list[list[float]]) -> None:
-        """写入候选框缓存，覆盖旧文件。"""
+    def save_proposals(
+        self, image_id: str, boxes: list[list[float]], roi_key: Optional[str] = None
+    ) -> None:
+        """写入候选框缓存，覆盖同 `roi_key` 的旧文件；不影响其他围栏的缓存。"""
         ...

@@ -2,12 +2,16 @@
 
 这是七任务的核心业务逻辑，只依赖三个 Protocol（worker / 图片存储 / 候选框来源），
 因此可以用假 worker 完整单测。
+
+电子围栏在这里体现为两件事：
+1. 候选框只在围栏内产生（交给 `ProposalSource` 处理）；
+2. 送模型的图把围栏外灰化（`fence.mask_outside`），尺寸不变、坐标不变。
 """
 from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 from PIL import Image
 
@@ -15,6 +19,7 @@ from ..errors import ApiError
 from ..protocols.image_store import ImageStore
 from ..protocols.proposal_source import ProposalSource
 from ..protocols.worker import WorkerProvider, VisionWorker
+from . import fence
 from .task_catalog import REGION_TASK_IDS, get_task
 
 
@@ -56,6 +61,7 @@ class DefaultTaskRunner:
         if not image_id:
             raise ApiError(400, "缺少 image_id。")
         image = self._store.load(str(image_id))
+        points = fence.normalize(payload.get("roi"), image.size)
 
         text = payload.get("text")
         if text is None:
@@ -64,13 +70,20 @@ class DefaultTaskRunner:
 
         boxes: Optional[list[list[float]]] = None
         boxes_source = "none"
+        boxes_cropped = False
         if task["needs_bbox"]:
-            boxes, boxes_source = self._resolve_boxes(str(image_id), image, payload)
+            boxes, boxes_source, boxes_cropped = self._resolve_boxes(
+                str(image_id), image, payload, points
+            )
             if not boxes:
                 raise ApiError(
                     400,
-                    f"{task['name']} 需要候选框：请先上传图片并生成 WeDetect 候选框，"
-                    "或手动传入 bbox_list。",
+                    (
+                        "围栏内没有候选框：请扩大围栏、关掉围栏后重试，或手动传入 bbox_list。"
+                        if points
+                        else f"{task['name']} 需要候选框：请先上传图片并生成 WeDetect 候选框，"
+                        "或手动传入 bbox_list。"
+                    ),
                 )
 
         indexes: Optional[list[int]] = payload.get("target_region_indexes")
@@ -86,8 +99,11 @@ class DefaultTaskRunner:
         if task_id != "vqa" and not text and task_id not in REGION_TASK_IDS:
             raise ApiError(400, f"{task['name']} 的 text 不能为空。")
 
+        # 围栏外灰化：尺寸与坐标都不变，只是模型看不见围栏外的像素
+        model_image = fence.mask_outside(image, points) if points else image
+
         started = time.perf_counter()
-        result = self._dispatch(worker, task_id, image, boxes, indexes, text, params)
+        result = self._dispatch(worker, task_id, model_image, boxes, indexes, text, params)
         elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
 
         return {
@@ -107,27 +123,36 @@ class DefaultTaskRunner:
             "top_p": params["top_p"],
             "boxes_source": boxes_source,
             "boxes_count": len(boxes) if boxes else 0,
+            "fence_applied": points is not None,
+            "fence_vertices": len(points) if points else 0,
+            "fence_cropped": boxes_cropped,
             "target_region_indexes": indexes if task["needs_index"] else None,
-            "warnings": _warnings(task_id, result, text, params),
+            "warnings": _warnings(task_id, result, text, params, points, boxes),
         }
 
     # -- 内部实现 -----------------------------------------------------------
     def _resolve_boxes(
-        self, image_id: str, image: Image.Image, payload: Mapping[str, Any]
-    ) -> tuple[Optional[list[list[float]]], str]:
+        self,
+        image_id: str,
+        image: Image.Image,
+        payload: Mapping[str, Any],
+        points: Optional[Sequence[Sequence[float]]] = None,
+    ) -> tuple[Optional[list[list[float]]], str, bool]:
         """决定本次用哪组候选框。
 
-        返回：(boxes, source)。source 取值 request / wedetect / wedetect-cache / none。
+        返回：(boxes, source, cropped)。source 取值 request / wedetect / wedetect-cache / none。
         优先级：请求显式传入 > 磁盘缓存 > 现场 WeDetect 生成（生成后写缓存）。
+        围栏存在时，显式传入的框同样要过一遍围栏过滤，保证「只看围栏内」语义一致。
         """
         boxes = payload.get("bbox_list")
         if boxes:
-            return boxes, "request"
+            kept = fence.filter_boxes(boxes, points) if points else boxes
+            return kept, "request", False
         if not payload.get("auto_proposals", True):
-            return None, "none"
-        proposal = self._proposals.get(image_id, image)
+            return None, "none", False
+        proposal = self._proposals.get(image_id, image, roi=points)
         source = "wedetect-cache" if proposal.source == "cache" else "wedetect"
-        return proposal.boxes, source
+        return proposal.boxes, source, proposal.cropped
 
     def _dispatch(
         self,
@@ -194,10 +219,20 @@ def _task_params(task: Mapping[str, Any], payload: Optional[Mapping[str, Any]]) 
 
 
 def _warnings(
-    task_id: str, result: Mapping[str, Any], text: str, params: Mapping[str, Any]
+    task_id: str,
+    result: Mapping[str, Any],
+    text: str,
+    params: Mapping[str, Any],
+    points: Optional[Sequence[Sequence[float]]] = None,
+    boxes: Optional[Sequence[Sequence[float]]] = None,
 ) -> list[str]:
     """按任务给出已知坑提示。永不为空抛异常，解析失败时静默降级。"""
     warnings: list[str] = []
+    if points and boxes is not None and len(boxes) < 5:
+        warnings.append(
+            f"围栏内只有 {len(boxes)} 个候选框，更小的目标可能没进候选池："
+            "可扩大围栏，或调高 WeDetect 的 num_proposals。"
+        )
     if task_id == "reasoning_detection":
         if params["max_new_tokens"] < 1024:
             warnings.append("max_new_tokens < 1024，思考链可能被截断，<answer> 标签可能出不来。")

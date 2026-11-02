@@ -1,7 +1,7 @@
 """WeDetect 候选框来源：懒加载权重（434MB），按图缓存到磁盘。
 
 模型实例是进程级单例，缓存在本对象上；候选框缓存在 `ImageStore` 里，
-因此同一张图重复请求不会重跑推理。
+因此同一张图重复请求不会重跑推理。带电子围栏时按围栏指纹另存一份缓存。
 """
 from __future__ import annotations
 
@@ -10,13 +10,14 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Sequence
 
 from PIL import Image
 
 from ..errors import ApiError
 from ..protocols.image_store import ImageStore
 from ..protocols.proposal_source import ProposalResult
+from . import fence
 from .device import resolve_device
 
 
@@ -49,36 +50,74 @@ class WedetectProposalSource:
         """见 `ProposalSource.ready`。"""
         return self._checkpoint.is_file()
 
-    def get(self, image_id: str, image: Image.Image, force: bool = False) -> ProposalResult:
-        """见 `ProposalSource.get`。命中缓存时 `elapsed_ms` 为 None。"""
+    def get(
+        self,
+        image_id: str,
+        image: Image.Image,
+        force: bool = False,
+        roi: Optional[Sequence[Sequence[float]]] = None,
+    ) -> ProposalResult:
+        """见 `ProposalSource.get`。
+
+        传 `roi` 时只裁围栏外接矩形推理，出框后过滤掉围栏外的框；
+        缓存按围栏指纹分文件，切换围栏不会串用旧结果。
+        """
+        points = fence.normalize(roi, image.size)
+        cache_key = fence.digest(points) if points else None
+
         if not force:
-            cached = self._store.load_proposals(image_id)
+            cached = self._store.load_proposals(image_id, cache_key)
             if cached:
                 return ProposalResult(boxes=cached, source="cache")
 
         started = time.perf_counter()
-        boxes = self._generate(image)
-        self._store.save_proposals(image_id, boxes)
+        boxes, cropped = self._generate(image, points)
+        self._store.save_proposals(image_id, boxes, cache_key)
         return ProposalResult(
             boxes=boxes,
             source="wedetect",
             elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+            cropped=cropped,
         )
 
     # -- 内部实现 -----------------------------------------------------------
-    def _generate(self, image: Image.Image) -> list[list[float]]:
-        """跑一次推理，返回 100 个候选框（原图像素坐标，保留两位小数）。"""
+    def _generate(
+        self, image: Image.Image, points: Optional[Sequence[Sequence[float]]] = None
+    ) -> tuple[list[list[float]], bool]:
+        """跑一次推理，返回候选框（原图像素坐标，保留两位小数）与是否做了裁剪。
+
+        围栏存在且占比够大时，只裁外接矩形送模型：围栏内分辨率更高，
+        100 个候选框额度不会被围栏外的大目标抢光。裁剪后必须把坐标平移回原图。
+        """
         import torch
 
         model = self._ensure_model()
+
+        target = image
+        offset_x = offset_y = 0.0
+        cropped = False
+        if points and fence.should_crop(points, image.size):
+            left, top, right, bottom = fence.bounds(points, image.size)
+            target = image.crop((left, top, right, bottom))
+            offset_x, offset_y = float(left), float(top)
+            cropped = True
+
         try:
             with torch.inference_mode():
-                outputs = model([image])
-                boxes = outputs[0]["bboxes"].float().cpu().tolist()
+                outputs = model([target])
+                raw_boxes = outputs[0]["bboxes"].float().cpu().tolist()
             del outputs
         except Exception as exc:  # noqa: BLE001
             raise ApiError(500, f"候选框生成失败：{type(exc).__name__}: {exc}") from exc
-        return [[round(float(v), 2) for v in box] for box in boxes]
+
+        boxes = (
+            [fence.box_to_fence_box(box, offset_x, offset_y) for box in raw_boxes]
+            if cropped
+            else [[round(float(v), 2) for v in box] for box in raw_boxes]
+        )
+        if points:
+            boxes = fence.filter_boxes(boxes, points)
+        return boxes, cropped
 
     def _ensure_model(self) -> Any:
         """懒加载并缓存模型（双检锁）。"""

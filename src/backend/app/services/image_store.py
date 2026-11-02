@@ -20,9 +20,10 @@ class LocalImageStore:
     """`ImageStore` 的本地磁盘实现。
 
     目录布局（root 下）：
-        {image_id}.png         落盘图（已按长边上限缩放）
-        {image_id}.json        元信息
-        {image_id}.boxes.json  WeDetect 候选框缓存
+        {image_id}.png                落盘图（已按长边上限缩放）
+        {image_id}.json               元信息
+        {image_id}.boxes.json         WeDetect 候选框缓存（整图）
+        {image_id}.boxes.{roi}.json   带电子围栏时的候选框缓存（每个围栏一份）
     """
 
     def __init__(self, root: Path, max_side: int = 1280) -> None:
@@ -66,9 +67,11 @@ class LocalImageStore:
         """见 `ImageStore.path`。"""
         return self._root / f"{image_id}.png"
 
-    def load_proposals(self, image_id: str) -> Optional[list[list[float]]]:
+    def load_proposals(
+        self, image_id: str, roi_key: Optional[str] = None
+    ) -> Optional[list[list[float]]]:
         """见 `ImageStore.load_proposals`。"""
-        path = self._boxes_path(image_id)
+        path = self._boxes_path(image_id, roi_key)
         if not path.is_file():
             return None
         try:
@@ -77,13 +80,21 @@ class LocalImageStore:
             return None
         return data if isinstance(data, list) and data else None
 
-    def save_proposals(self, image_id: str, boxes: list[list[float]]) -> None:
+    def save_proposals(
+        self, image_id: str, boxes: list[list[float]], roi_key: Optional[str] = None
+    ) -> None:
         """见 `ImageStore.save_proposals`。"""
-        self._boxes_path(image_id).write_text(json.dumps(boxes), encoding="utf-8")
+        self._boxes_path(image_id, roi_key).write_text(json.dumps(boxes), encoding="utf-8")
 
     # -- 内部实现 -----------------------------------------------------------
-    def _boxes_path(self, image_id: str) -> Path:
-        return self._root / f"{image_id}.boxes.json"
+    def _boxes_path(self, image_id: str, roi_key: Optional[str] = None) -> Path:
+        """候选框缓存路径。
+
+        带围栏指纹时用独立文件名（`{id}.boxes.{key}.json`），整图那份保持原文件名，
+        这样新旧缓存互不覆盖：同一张图画不同围栏各存一份。
+        """
+        suffix = f".boxes.{roi_key}.json" if roi_key else ".boxes.json"
+        return self._root / f"{image_id}{suffix}"
 
     def _meta_path(self, image_id: str) -> Path:
         return self._root / f"{image_id}.json"

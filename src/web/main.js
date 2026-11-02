@@ -7,6 +7,7 @@
 import { createHttpClient } from "../features/api/http-client.js";
 import { createVlxApi } from "../features/api/vlx-api.js";
 import { normalizeBoxes } from "../features/bbox/bbox-geometry.js";
+import { describeFence } from "../features/fence/fence-geometry.js";
 import {
   buildRunPayload,
   buildSuiteOverrides,
@@ -17,6 +18,7 @@ import {
 import { indexTasks, taskNumber } from "../features/task/task-catalog.js";
 import { FORM_STORE_KEY, PALETTE } from "../shared/contracts.js";
 import { createAnnotator } from "./canvas/annotator.js";
+import { createFenceEditor } from "./canvas/fence-editor.js";
 import { $ } from "./dom.js";
 import { markNavDone, renderNav, setActiveNav } from "./render/nav.js";
 import { renderTaskForm } from "./render/form.js";
@@ -36,6 +38,8 @@ const state = {
   boxes: [],
   selected: [],
   showBoxes: true,
+  fence: null,
+  fenceMode: "none",
   forms: {},
   status: null,
   busy: false,
@@ -44,6 +48,15 @@ const state = {
   suiteResults: {},
   wedetectReady: false,
 };
+
+/** 围栏绘制器。画完把顶点交回 `applyFence`，模式变化交回 `renderFenceMode`。 */
+const fenceEditor = createFenceEditor({
+  canvas: $("canvas"),
+  annotator,
+  onChange: applyFence,
+  onModeChange: renderFenceMode,
+  onError: (message) => toast(message, true),
+});
 
 /** 当前表单渲染句柄，用于画布点选后回填索引输入框。 */
 let formView = null;
@@ -91,6 +104,7 @@ async function loadMeta() {
     onSuite: () => $("suiteCard").scrollIntoView({ behavior: "smooth", block: "start" }),
   });
   renderSuite();
+  updateFenceStat();
 
   selectTask("vqa");
   pollStatus();
@@ -264,8 +278,10 @@ function applyImage(info) {
   state.image = info;
   state.boxes = [];
   state.selected = [];
+  state.fence = null;
   state.result = null;
   state.resultTask = null;
+  fenceEditor.setMode("none");
 
   $("imageMeta").textContent =
     `${info.filename || "image"} · ${info.width}×${info.height}` +
@@ -274,12 +290,16 @@ function applyImage(info) {
   $("toggleBoxes").disabled = false;
   $("clearBoxesBtn").disabled = true;
   $("proposalBtn").disabled = false;
+  $("fenceRectBtn").disabled = false;
+  $("fencePolyBtn").disabled = false;
 
+  annotator.setFence(null);
   annotator.setBoxes([]);
   annotator.setSelected([]);
   annotator.setResult(null);
   updateBoxStat();
   updateSelectedBar();
+  updateFenceStat();
   renderResultForTask();
 
   const img = new Image();
@@ -291,11 +311,73 @@ function applyImage(info) {
 /** 刷新候选框计数与相关按钮状态。 */
 function updateBoxStat() {
   const count = state.boxes.length;
+  const scope = state.fence ? "（围栏内）" : "";
   $("boxStat").textContent = count
-    ? `候选框 ${count} 个`
-    : "候选框 0 个（运行时自动用 WeDetect 生成）";
+    ? `候选框 ${count} 个${scope}`
+    : state.fence
+      ? "候选框 0 个（运行时只在围栏内自动生成）"
+      : "候选框 0 个（运行时自动用 WeDetect 生成）";
   $("clearBoxesBtn").disabled = !count;
   $("proposalBtn").disabled = !state.image || state.busy;
+}
+
+/* ----------------------------- 电子围栏 ----------------------------- */
+
+/**
+ * 接收绘制完成的多边形：落状态、清掉旧候选框。
+ * @param {number[][]} points 原图像素顶点列
+ * 为什么清空候选框：旧框是整图生成的，与围栏不是同一批；留着会让人误以为围栏没生效。
+ */
+function applyFence(points) {
+  state.fence = points;
+  state.boxes = [];
+  state.selected = [];
+  annotator.setFence(points);
+  annotator.setBoxes([]);
+  annotator.setSelected([]);
+  updateBoxStat();
+  updateSelectedBar();
+  updateFenceStat();
+  toast(`围栏已设置：${describeFence(points)}，生成候选框只在该区域内出框`);
+}
+
+/** 清除围栏，同时清空由它生成的候选框。 */
+function clearFence() {
+  state.fence = null;
+  state.boxes = [];
+  state.selected = [];
+  fenceEditor.setMode("none");
+  annotator.setFence(null);
+  annotator.setBoxes([]);
+  annotator.setSelected([]);
+  updateBoxStat();
+  updateSelectedBar();
+  updateFenceStat();
+  toast("围栏已清除，回到整图模式");
+}
+
+/**
+ * 同步绘制模式到按钮态与提示文案。
+ * @param {"none"|"rect"|"polygon"} mode
+ */
+function renderFenceMode(mode) {
+  state.fenceMode = mode;
+  $("fenceRectBtn").classList.toggle("fence-on", mode === "rect");
+  $("fencePolyBtn").classList.toggle("fence-on", mode === "polygon");
+  const hint = $("fenceHint");
+  hint.classList.toggle("active", mode !== "none");
+  hint.textContent =
+    mode === "rect"
+      ? "按住左键拖出一块矩形围栏，松开即生效。Esc 取消。"
+      : mode === "polygon"
+        ? "逐点点击画多边形：点首点 / 双击 / 回车闭合，Backspace 撤销上一点，Esc 取消。"
+        : "画好围栏后：候选框只在围栏内生成，送模型时围栏外像素灰化。多边形逐点点击，点首点 / 双击 / 回车闭合，Esc 取消。";
+}
+
+/** 刷新围栏统计与「清除围栏」按钮可用性。 */
+function updateFenceStat() {
+  $("fenceStat").textContent = `围栏：${describeFence(state.fence)}`;
+  $("fenceClearBtn").disabled = !state.fence;
 }
 
 /** 刷新「已选区域」条：chips + 清空链接。 */
@@ -341,18 +423,16 @@ async function generateProposals() {
   $("proposalBtn").disabled = true;
   $("proposalBtn").textContent = "生成中…";
   try {
-    const res = await api.getProposals(state.image.image_id);
+    const res = await api.getProposals(state.image.image_id, false, state.fence);
     state.boxes = res.boxes;
     state.selected = [];
     annotator.setBoxes(res.boxes);
     annotator.setSelected([]);
     updateBoxStat();
     updateSelectedBar();
-    toast(
-      `候选框 ${res.count} 个（${
-        res.source === "cache" ? "缓存" : `${(res.elapsed_ms / 1000).toFixed(1)}s`
-      }）`
-    );
+    const timing = res.source === "cache" ? "缓存" : `${(res.elapsed_ms / 1000).toFixed(1)}s`;
+    const scope = res.cropped ? " · 围栏内裁剪推理" : "";
+    toast(`候选框 ${res.count} 个（${timing}${scope}）`);
   } catch (err) {
     toast(`候选框生成失败：${err.message}`, true);
   } finally {
@@ -403,6 +483,7 @@ async function runTask() {
     imageId: state.image.image_id,
     boxes: state.boxes,
     regionIndexes,
+    roi: state.fence,
   });
 
   setBusy(true, task.id === "reasoning_detection" ? "推理中，思考链约需 20s…" : "运行中…");
@@ -411,10 +492,10 @@ async function runTask() {
     state.result = res;
     state.resultTask = task.id;
 
-    // 后端自动生成的候选框回填到画布，后续任务可直接复用
+    // 后端自动生成的候选框回填到画布，后续任务可直接复用（围栏存在时回填的也是围栏内那批）
     if (res.boxes_source && res.boxes_source.startsWith("wedetect")) {
       try {
-        const proposals = await api.getProposals(state.image.image_id);
+        const proposals = await api.getProposals(state.image.image_id, false, state.fence);
         state.boxes = proposals.boxes;
         annotator.setBoxes(proposals.boxes);
         updateBoxStat();
@@ -471,6 +552,7 @@ async function runSuite() {
     const res = await api.runSuite({
       image_id: state.image.image_id,
       bbox_list: state.boxes.length ? state.boxes : null,
+      roi: state.fence,
       auto_proposals: true,
       overrides,
     });
@@ -516,6 +598,7 @@ function bind() {
   const dropzone = $("dropzone");
   dropzone.onclick = (event) => {
     if (!state.image) return $("fileInput").click();
+    if (fenceEditor.isActive()) return; // 正在画围栏，不响应候选框点选
     if (event.target !== $("canvas")) return;
     toggleSelection(annotator.hitTestEvent(event));
   };
@@ -530,8 +613,17 @@ function bind() {
     uploadFile(event.dataTransfer.files[0]);
   });
 
-  $("canvas").addEventListener("mousemove", (event) => annotator.updateHover(event));
+  $("canvas").addEventListener("mousemove", (event) => {
+    if (fenceEditor.isActive()) return;
+    annotator.updateHover(event);
+  });
   $("canvas").addEventListener("mouseleave", () => annotator.clearHover());
+
+  $("fenceRectBtn").onclick = () =>
+    fenceEditor.setMode(state.fenceMode === "rect" ? "none" : "rect");
+  $("fencePolyBtn").onclick = () =>
+    fenceEditor.setMode(state.fenceMode === "polygon" ? "none" : "polygon");
+  $("fenceClearBtn").onclick = clearFence;
 
   $("proposalBtn").onclick = generateProposals;
   $("clearBoxesBtn").onclick = () => {
