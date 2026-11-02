@@ -187,3 +187,68 @@
 2. **只支持单围栏**：多个围栏同时生效、反向围栏（只检测围栏外）均未做。
 3. **围栏不可编辑**：画歪了只能清除重画，没有顶点拖拽。
 4. **`num_proposals` 仍是固定 100**：围栏提升的是「围栏内分到多少额度」，不是总额度上限。要放开上限需把它提成配置项（上一轮讨论过的第二个可选项），本轮未做。
+
+---
+
+## 2026-11-02 · 生产消费队列：外部服务推图异步处理
+
+### 涉及模块
+
+| 组 | 文件 | 性质 |
+|---|---|---|
+| backend | `services/job_queue.py` | 新增，队列唯一实现（入队 / 单消费者 / 结果留存 / 容量） |
+| backend | `protocols/job_queue.py` | 新增，`JobQueue` + `JobSpec` 契约 |
+| backend | `routers/queue.py` | 新增，4 个 HTTP 端点 + multipart 字段解析 |
+| backend | `config.py` | 改，新增 `read_config_file()` 与 4 个 `QUEUE_*` 配置 |
+| backend | `errors.py` / `main.py` | 改，`ApiError.headers` 透传（`Retry-After`）+ lifespan 启停消费者 |
+| backend | `deps.py` / `routers/__init__.py` / `services/__init__.py` | 改，单例、路由注册、模块索引 |
+| 根 | `launcher.py` | 改，`save_config` 不再整文件重写（否则改端口会抹掉 `queue_*`） |
+| 根 | `config.ini` | 改，新增 4 个 `queue_*` 键 |
+
+前端零改动：队列只对外部服务暴露 HTTP，调测台页面不受影响。
+
+### 变更摘要
+
+同步接口 `POST /api/tasks/{task}/run` 单次 1~45s，采集端按间隔推图会被自己的调度器卡死；而 10B 模型单卡只能串行。所以加一层**内存队列 + 单消费者**：
+
+- **投递**：`POST /api/queue/jobs`（multipart，`file` 或 `image_id` 二选一 + `tasks` + 可选 `roi`/`text`/`lang`/…），校验通过立刻 `202` 返回 `job_id`。
+- **超限**：容量只算「等待中」的任务（正在推理的不占额度）。满了抛 `ApiError(429)`，`detail` 形如「队列已超限：当前排队 32 个，上限 32 个。请 10 秒后再投递…」，同时带 `Retry-After` 响应头——外部服务可以纯靠状态码 + 头做退避，不用解析中文。
+- **消费**：单个消费者协程；推理用 `asyncio.to_thread` 丢到线程，否则一次推理就把事件循环（含 `/api/status` 轮询）一起堵住。
+- **结果**：一个 job 可带多个 `task`，串行跑，单任务失败不中断其它；终态 `succeeded` / `partially_failed` / `failed`，失败项带 `error` 与 `status_code`。
+- **留存**：记录只在内存，最多 `queue_max_records` 条，超出淘汰最早结束的（查不到返回 `404` 并说明淘汰）。
+- **关停**：`lifespan` 取消消费者，正在跑的任务 `_finalize(interrupted=True)` 记 `failed`（「服务关闭，任务中断。」），避免外部服务永远轮询 `running`。
+
+两个容易踩的实现细节：
+
+1. **容量判断必须在落盘之前**。否则队列满时已经把图写进 `data/images/`，产生一堆没人处理的孤儿图。验证据此断言「超限时落盘计数不变」。
+2. **空闲唤醒不能丢事件**。消费者用「先查队列 → 清标志 → 再查 → 才 await」的顺序；`submit` 在 `append + set` 之间没有 `await`，单线程事件循环下不存在丢失窗口。反之若写成「查空就 clear 然后 await」，并发投递会永久睡死。
+
+### 影响面
+
+- **默认行为不变**：一条请求都不走 `/api/queue/*` 时，7 个任务的执行路径、候选框缓存、围栏逻辑、前端全部与上一版一致。
+- **HTTP 接口**：新增 4 个端点（投递 / 查单个 / 列表 / 水位），OpenAPI 从 9 个 `/api` 路径变 12 个。
+- **配置**：`config.ini` 新增 `queue_enabled` / `queue_max_size` / `queue_max_records` / `queue_retry_after`，环境变量 `VLX_QUEUE_*` 可覆盖。**改配置需重启服务生效**。
+- **磁盘**：队列本身不落盘；推上来的图仍走原有 `data/images/`（可随时删）。
+- **部署方案已变更**：`config.ini` 多了 4 个键、`README` 新增 4.2 节（接口 / 响应码语义 / 队列规则 / 配置表 / 容量估算）。启动命令、端口、依赖、`启动器.exe` 打包链路均未变，不需要重新打包启动器；但因为改了后端代码，**必须重启服务**。
+- **进程约束**：必须单进程 uvicorn（`src/main.py` 就是单进程）。加 `--workers N` 会出现 N 个独立队列，容量翻倍且互不可见。
+
+### 自测结论
+
+三层验证，共 102 项断言全过（脚本为临时文件，未入库）：
+
+- **服务层 46 项**（假 runner / 假 store，不加载模型）：未 `start` 时 503、`position` 递增、超限 429 且 `Retry-After` 正确、超限不落盘、FIFO 顺序、并发峰值恒为 1（真串行）、多任务部分失败不中断、`roi`/`text`/`lang`/`max_new_tokens`/`client_ref` 透传、四个校验分支（空任务/未知任务/没图/图不存在）、`image_id` 复用不重复落盘、列表过滤与限量、非法 status 400、关闭开关 503、`max_records=10` 时最老记录被淘汰、关停时运行中任务记 `failed`（文案含「服务关闭」）。
+- **HTTP 层 29 项**（TestClient + 假队列）：`202` 与响应字段、`tasks` 分隔符与 JSON 数组两种写法都解析、`429` 带 `Retry-After: 9` 且 `detail` 含「队列已超限」、`/status` 水位、`/jobs/{id}` 200 与 404、列表带水位与 status 过滤、`limit` 越界 422、缺图/空任务/未知任务 400、`roi` 非法 JSON 与非数组都 400 且文案带字段名、复用 `image_id` 202、关闭时 503。
+- **真集成 25 项**（真 `LocalImageStore` + 真 `DefaultTaskRunner` + 假 worker，不加载 10B 模型）：`detection` 跑通且围栏把围栏外候选框滤掉、`boxes_source=request`、落盘图尺寸不变、`image` 元信息回填；多任务共享同图各跑一遍；区域任务缺索引 → `failed` 且 `status_code=400` 落到 `results`（消费者不挂）；给索引 → 成功且索引透传；无围栏时不过滤（旧行为不变）；`tasks_run` 累计正确；OpenAPI 含 3 条新路径、`/api` 路径总数 12。
+
+静态检查：改动与新增 Python 文件 `py_compile` 全过；`launcher.py` 的 `save_config` 用临时文件验证过「改端口后 `queue_*` 与注释仍在」。
+
+**未做真机模型链路验证**：现有服务（`cuda:0`，已占用 22.6/24.5GB 显存）正在跑旧代码，另起一个进程加载 10B 模型会 OOM，因此队列到模型这一段是用假 worker 验证的注意力边界——`job_queue` 只调 `runner.run(task_id, payload)`，与 `/api/tasks/{task}/run` 同一条路径，没有新增模型侧耦合。重启服务后建议实测一次：推一张图 → 轮询到 `succeeded`。
+
+### 遗留项（明确未做）
+
+1. **队列不持久化**：重启丢排队与历史。有意为之（推理结果对调用方本无意义），需要留痕请外部服务自己存库。
+2. **无鉴权 / 无限流**：定位本机内部服务，默认只听 `127.0.0.1`；跨机接入需前置反向代理。
+3. **无优先级 / 取消 / 自动重试**：队列只摊平突发；重试语义归调用方。
+4. **前端无队列面板**：页面看不到排队水位，只能查 `GET /api/queue/status`。若后续要在调测台上看，属于新需求。
+5. **一个 job 内的任务共用同一组参数**：`text`/`lang`/`roi` 是 job 级的，多任务想用不同 `text` 得拆成多个 job。没有做 per-task overrides（`/api/suite/run` 才有 `overrides`）。
+6. **未新建 `docs/deployment.md`**：沿用上一轮决定——部署面就是「venv + 四个 bat + 启动器 + config.ini」，`README` 的「快速开始」「1.1 启动器」「4.2 队列配置」已覆盖全部步骤与环境变量表。

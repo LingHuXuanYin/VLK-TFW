@@ -13,16 +13,25 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import FEATURES_DIR, SHARED_DIR, WEB_DIR
-from .deps import get_model_runtime
+from .deps import get_job_queue, get_model_runtime
 from .errors import ApiError
 from .routers import ALL_ROUTERS
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """服务启动即在后台加载模型；前端轮询 `/api/status` 展示进度。"""
+    """服务启动即在后台加载模型；前端轮询 `/api/status` 展示进度。
+
+    同时拉起队列消费者（`queue_enabled=false` 时为空操作）。关停时先停消费者，
+    正在跑的那个任务会被记为失败，避免外部服务一直轮询一个永远不变的 running。
+    """
     get_model_runtime().start_loading()
-    yield
+    queue = get_job_queue()
+    await queue.start()
+    try:
+        yield
+    finally:
+        await queue.stop()
 
 
 def create_app() -> FastAPI:
@@ -43,11 +52,16 @@ def create_app() -> FastAPI:
 
 
 def _register_error_handler(application: FastAPI) -> None:
-    """把 services 抛的 `ApiError` 翻译成 `{"detail": ...}`，与重构前 HTTPException 一致。"""
+    """把 services 抛的 `ApiError` 翻译成 `{"detail": ...}`，与重构前 HTTPException 一致。
+
+    `headers` 一并透传：队列超限的 `Retry-After` 靠它带回给外部服务。
+    """
 
     @application.exception_handler(ApiError)
     async def _handle_api_error(_request: Request, exc: ApiError) -> JSONResponse:
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        return JSONResponse(
+            status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers
+        )
 
 
 def _mount_static(application: FastAPI) -> None:

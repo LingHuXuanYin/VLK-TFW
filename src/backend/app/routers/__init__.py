@@ -6,6 +6,7 @@ from fastapi import APIRouter
 from .images import router as images_router
 from .meta import router as meta_router
 from .proposals import router as proposals_router
+from .queue import router as queue_router
 from .status import router as status_router
 from .tasks import router as tasks_router
 
@@ -15,4 +16,5 @@ ALL_ROUTERS: tuple[APIRouter, ...] = (
     images_router,
     proposals_router,
     tasks_router,
+    queue_router,
 )

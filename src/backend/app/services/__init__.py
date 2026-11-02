@@ -8,4 +8,5 @@
 - model_runtime.py    模型加载与状态机（唯一持有进程级状态）
 - task_runner.py      单任务：校验 + 派发 + 警告
 - suite_runner.py     全量：串行编排七个任务
+- job_queue.py        生产消费队列：外部推图入队、单消费者串行跑、结果留存
 """

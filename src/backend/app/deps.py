@@ -10,13 +10,19 @@ from .config import (
     DEVICE_PREFERENCE,
     MAX_IMAGE_SIDE,
     MODEL_PATH,
+    QUEUE_ENABLED,
+    QUEUE_MAX_RECORDS,
+    QUEUE_MAX_SIZE,
+    QUEUE_RETRY_AFTER,
     VLX_SEEK_ROOT,
     WEDETECT_PATH,
 )
 from .protocols.image_store import ImageStore
+from .protocols.job_queue import JobQueue
 from .protocols.proposal_source import ProposalSource
 from .protocols.task_runner import SuiteRunner, TaskRunner
 from .services.image_store import LocalImageStore
+from .services.job_queue import InMemoryJobQueue
 from .services.model_runtime import ModelRuntime
 from .services.suite_runner import DefaultSuiteRunner
 from .services.task_runner import DefaultTaskRunner
@@ -30,6 +36,15 @@ _proposal_source: ProposalSource = WedetectProposalSource(
 )
 _task_runner: TaskRunner = DefaultTaskRunner(_model_runtime, _image_store, _proposal_source)
 _suite_runner: SuiteRunner = DefaultSuiteRunner(_task_runner)
+# 队列容量等参数来自 config.ini（queue_*），环境变量 VLX_QUEUE_* 可覆盖
+_job_queue: JobQueue = InMemoryJobQueue(
+    _task_runner,
+    _image_store,
+    capacity=QUEUE_MAX_SIZE,
+    max_records=QUEUE_MAX_RECORDS,
+    retry_after=QUEUE_RETRY_AFTER,
+    enabled=QUEUE_ENABLED,
+)
 
 
 # -- 依赖获取函数（供 FastAPI Depends 使用） --------------------------------
@@ -56,3 +71,8 @@ def get_task_runner() -> TaskRunner:
 def get_suite_runner() -> SuiteRunner:
     """返回全量调测执行器单例。"""
     return _suite_runner
+
+
+def get_job_queue() -> JobQueue:
+    """返回生产消费队列单例（外部服务投递入口的唯一持有者）。"""
+    return _job_queue

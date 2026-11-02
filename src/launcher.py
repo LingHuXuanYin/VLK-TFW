@@ -92,14 +92,51 @@ def load_config() -> dict:
 
 
 def save_config(port: str, host: str) -> None:
-    body = (
-        "# Taozi VLX 调测台 · 本地配置\n"
-        "# 由「启动器.exe」读写，run.bat / debug.bat 也会读取这里的 port\n"
-        "# 端口优先级：命令行参数 > 环境变量 PORT > 本文件 > 7860\n"
-        f"port={port}\n"
-        f"host={host}\n"
-    )
-    CONFIG_FILE.write_text(body, encoding="utf-8")
+    """写入端口与主机，**保留文件里的其他配置项和注释**。
+
+    为什么不是直接覆盖成一个只有 port/host 的新文件：`config.ini` 现在同时承载队列参数
+    （`queue_enabled` / `queue_max_size` / `queue_max_records` / `queue_retry_after`），
+    启动器改端口时如果整文件重写，会把用户配好的队列容量抹掉，且没有任何提示。
+
+    入参：`port` / `host` 为字符串形式的目标值。
+    返回：无。
+    异常：磁盘不可写时抛 `OSError`（调用方会弹窗提示）。
+    边界：文件不存在时写出完整默认模板；`port` / `host` 重复出现时只保留第一处并改写它。
+    """
+    lines: list[str] = []
+    if CONFIG_FILE.exists():
+        try:
+            lines = CONFIG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            lines = []
+    if not lines:
+        lines = [
+            "# Taozi VLX 调测台 · 本地配置",
+            "# 由「启动器.exe」读写，run.bat / debug.bat 也会读取这里的 port",
+            "# 端口优先级：命令行参数 > 环境变量 PORT > 本文件 > 7860",
+            "port=7860",
+            "host=127.0.0.1",
+        ]
+
+    targets = {"port": port, "host": host}
+    written: set[str] = set()
+    out: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        key = ""
+        if stripped and stripped[0] not in "#;[" and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip().lower()
+        if key in targets:
+            if key in written:  # 去掉重复的 port/host 行
+                continue
+            written.add(key)
+            out.append(f"{key}={targets[key]}")
+        else:
+            out.append(line)
+    for key, value in targets.items():
+        if key not in written:
+            out.append(f"{key}={value}")
+    CONFIG_FILE.write_text("\n".join(out) + "\n", encoding="utf-8")
 
 
 def valid_port(text: str) -> int | None:

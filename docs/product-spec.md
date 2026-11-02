@@ -17,6 +17,30 @@
 
 参数按任务存在 `localStorage`（键 `taozi-vlx-forms-v1`），刷新不丢。围栏**不持久化**：换图或刷新即清空，避免拿上一张图的坐标套到新图上。
 
+## 1.1 外部服务怎么用（生产消费队列）
+
+页面之外的第二个入口：外侧的采集服务推图进队列，服务端串行消化。它不碰 UI，只有两个动作。
+
+1. **投递**：`POST /api/queue/jobs`，multipart 带 `file`（或已上传的 `image_id`）+ `tasks`（7 个任务 id，可多个）+ 需要的 `text` / `lang` / `roi`。
+   立刻返回 `202` 和 `job_id`，**不等推理**。
+2. **轮询**：`GET /api/queue/jobs/{job_id}`。`status` 是 `queued` / `running` 时继续等；
+   进入 `succeeded` / `partially_failed` / `failed` 后，从 `results` 里按 `task` 取答案与框。
+
+投递被拒的三种情况，含义完全不同，**别一律重试**：
+
+| 返回 | 说明 | 调用方动作 |
+|---|---|---|
+| `429` + `Retry-After` | 队列已超限（`detail` 写明当前排队数与上限） | 按 `Retry-After` 退避后重投，不要立刻重试 |
+| `400` | 参数错（任务 id 不认识、`roi` 不是 JSON 数组、没给图） | 改参数，重试也没用 |
+| `503` | 队列接入被关闭（`queue_enabled=false`） | 找运维，别刷接口 |
+
+怎么配容量：`config.ini` 的 `queue_max_size` 是「最多缓冲多少个待处理任务」。
+推图间隔 × 单任务耗时接近 1 时队列会长期满，这时应该降低推图频率，而不是把上限调大——
+调大只是把内存里的积压变多，吞吐不会涨（单卡串行，物理约束）。
+
+队列是**内存队列**：服务重启后排队与历史全清，`job_id` 查不到就是 `404`。
+外部服务要留痕请自己存库，别把本服务当存储。
+
 ## 2. 代码地图
 
 ```
@@ -27,12 +51,13 @@ Taozi-VLX-deepseek/
 │   ├── backend/app/
 │   │   ├── config.py             # 唯一的路径/环境变量来源（含 chdir 到 VLX-Seek）
 │   │   ├── schemas.py            # pydantic 请求模型
-│   │   ├── protocols/            # ImageStore / ProposalSource / WorkerProvider / VisionWorker
+│   │   ├── protocols/            # ImageStore / ProposalSource / WorkerProvider / VisionWorker / JobQueue
 │   │   ├── services/             # task_catalog（元数据）、model_runtime、wedetect_source、
-│   │   │                         # image_store、fence（围栏几何）、task_runner、suite_runner
+│   │   │                         # image_store、fence（围栏几何）、task_runner、suite_runner、
+│   │   │                         # job_queue（生产消费队列）
 │   │   ├── deps.py               # 组装根：单例在此创建，路由通过 Depends 取
-│   │   ├── routers/              # meta / status / images / proposals / tasks
-│   │   └── main.py               # FastAPI 组装：lifespan、静态挂载、include_router
+│   │   ├── routers/              # meta / status / images / proposals / tasks / queue
+│   │   └── main.py               # FastAPI 组装：lifespan（含队列启停）、静态挂载、include_router
 │   ├── features/
 │   │   ├── api/                  # http-client（注入 fetch）、vlx-api（端点适配）
 │   │   ├── task/                 # task-catalog：分组、序号、模板取值
@@ -64,6 +89,9 @@ Taozi-VLX-deepseek/
 | 围栏裁剪/过滤/灰化的几何实现 | `src/backend/app/services/fence.py` |
 | 围栏在画布上的绘制与拾取交互 | `src/web/canvas/fence-editor.js` + `src/web/canvas/annotator.js` |
 | 围栏前端校验（顶点、面积、贴合首点） | `src/features/fence/fence-geometry.js` |
+| 队列容量、超限文案、记录淘汰 | `src/backend/app/services/job_queue.py` |
+| 队列 HTTP 形状（表单字段解析、响应码） | `src/backend/app/routers/queue.py` |
+| 队列配置项默认值 | `src/backend/app/config.py` + `config.ini` 的 `queue_*` |
 | 图片缩放与落盘 | `src/backend/app/services/image_store.py` |
 | 新增 HTTP 端点 | `src/backend/app/routers/` 下对应文件 |
 | 服务入口 / 启动参数 | `src/main.py` |
@@ -83,6 +111,7 @@ Taozi-VLX-deepseek/
 - 模型对象、锁、磁盘路径只在 `services/` 与 `deps.py` 出现。
 - 拼绝对路径只在 `src/backend/app/config.py` 一处：它导出 `SRC_ROOT`（源码根）与 `PROJECT_ROOT`（项目根），其他文件一律 import 常量。
 - **围栏几何有两份实现**：`backend/app/services/fence.py` 与 `features/fence/fence-geometry.js`。前端负责「画得出、拦得住明显错误」，后端负责「算得准、说了算」。改判定口径（顶点容差 2px、点在多边形边界算在内）必须两边同步，否则会出现前端能画、后端 400 的割裂。
+- **队列只有一个消费者**：`services/job_queue.py` 用 `asyncio.to_thread` 把同步推理丢出事件循环，但**不并行**。不要在这里加线程池或第二个消费者——单卡串行是设计前提，并发只会互抢显存。同理，服务必须单进程运行（`--workers > 1` 会产生多个互相看不见的队列）。
 
 ## 5. 启动与端口
 

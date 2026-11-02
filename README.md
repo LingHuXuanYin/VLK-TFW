@@ -104,6 +104,10 @@
 | POST | `/api/proposals` | 生成/读取 WeDetect 候选框，`{"image_id": "...", "force": false, "roi": null}` |
 | POST | `/api/tasks/{task}/run` | 跑单个任务 |
 | POST | `/api/suite/run` | 串行跑完 7 个任务 |
+| POST | `/api/queue/jobs` | 外部服务投递检测任务（multipart），`202` 立即返回 `job_id` |
+| GET | `/api/queue/jobs/{job_id}` | 查任务状态与结果 |
+| GET | `/api/queue/jobs` | 倒序列出仍保留的任务，可按 `status` 过滤 |
+| GET | `/api/queue/status` | 队列水位（容量 / 排队 / 处理中 / 累计计数） |
 
 单任务请求体：
 
@@ -149,6 +153,106 @@
 换一个围栏       90 框，与前一围栏结果不同，越界 0 个
 ```
 
+### 4.2 生产消费队列（外部服务接入）
+
+外部的采集服务会定期推图，它不该同步等推理（10B 模型单任务 1~45s），所以走队列：
+投递拿到 `job_id` 就走，自己按需轮询结果。
+
+```
+外部服务                                本服务
+   │  POST /api/queue/jobs  ─────────▶  参数校验 → 入队 → 202 {job_id}
+   │                                    ↓ 单消费者串行推理（GPU 同一时刻只跑一个任务）
+   │  GET /api/queue/jobs/{job_id} ───▶  queued / running / succeeded / partially_failed / failed
+   │                                    ↓ 终态后读 results
+```
+
+#### 投递
+
+```bash
+curl -X POST http://127.0.0.1:7860/api/queue/jobs \
+  -F "file=@D:\cam\20261102-1030.jpg" \
+  -F "tasks=detection" \
+  -F "text=orange; apple" \
+  -F "lang=zh" \
+  -F "client_ref=cam-01/20261102-1030"
+```
+
+```json
+{
+  "ok": true, "job_id": "9f3c1a77b0d2", "status": "queued", "position": 1,
+  "capacity": 32, "tasks": ["detection"], "image_id": "421608b7bc4a",
+  "client_ref": "cam-01/20261102-1030", "submitted_at": "2026-11-02T10:30:11+08:00"
+}
+```
+
+字段说明：
+
+| 字段 | 说明 |
+|---|---|
+| `file` / `image_id` | 二选一。直接推图用 `file`；复用已上传图用 `image_id`（`POST /api/images` 的返回值） |
+| `tasks` | 任务 id，逗号 / 分号 / 空格分隔，或 JSON 数组字符串；取值必须是第 3 节那 7 个。可一次带多个，串行跑 |
+| `text` / `lang` / `max_new_tokens` / `temperature` / `top_p` | 与 `POST /api/tasks/{task}/run` 同义，缺省走任务默认值 |
+| `bbox_list` / `roi` / `target_region_indexes` | 传 **JSON 字符串**；`roi` 是电子围栏（见 4.1），区域任务必须给 `target_region_indexes` |
+| `client_ref` | 调用方自己的业务主键，原样回显，便于对账 |
+
+响应码语义（调用方按这个分支处理，不要一律重试）：
+
+| 码 | 含义 | 该怎么做 |
+|---|---|---|
+| `202` | 已入队 | 记下 `job_id`，1~2s 后开始轮询 |
+| `400` | 参数错：未知任务 id / JSON 字段格式错 / 没给图片 | **别重试**，改参数 |
+| `404` | `image_id` 指向的图不存在或已过期 | 重新上传，或改用 `file` |
+| `429` | **队列已超限**，`detail` 写明当前排队数与上限 | 按响应头 `Retry-After` 退避后重投 |
+| `503` | 队列接入被关闭（`queue_enabled=false`）或消费者未启动 | 查 `/api/queue/status`，找运维 |
+
+#### 取结果
+
+```json
+{
+  "ok": true, "job_id": "9f3c1a77b0d2", "status": "succeeded",
+  "queue_wait_ms": 812.4, "elapsed_ms": 2910.2,
+  "progress": {"done": 1, "total": 1},
+  "results": [{
+    "task": "detection", "task_name": "多类别检测", "ok": true,
+    "answer": "<ground>orange</ground><objects><obj6>…",
+    "result_bbox_list": [{"label": "orange", "bbox": [107, 118, 229, 258]}],
+    "boxes_source": "wedetect", "boxes_count": 100,
+    "prompt_tokens": 411, "completion_tokens": 19, "elapsed_ms": 2900.3,
+    "warnings": []
+  }]
+}
+```
+
+一个 job 带多个任务时，`results` 每个任务一条；单任务失败**不影响**其它任务，失败项形如
+`{"task": "...", "ok": false, "error": "…", "status_code": 400}`。终态判定：
+全成功 `succeeded` / 部分成功 `partially_failed` / 全失败 `failed`。
+
+#### 队列规则（决定容量怎么配）
+
+- **上限只算「等待中」的任务**，正在推理的那个不占额度。`queue_max_size=1` 的含义是「一次只缓冲一个」。
+- 队列满直接 `429`，**不阻塞、不排队、不落盘**，HTTP 线程立刻释放。
+- 进程内只有**一个消费者**，同一时刻只跑一个任务（10B 模型并行只会互相抢显存）。所以队列的作用是
+  **把突发流量摊平**，不是提高吞吐：外部服务推图频率必须低于「单任务平均耗时」的倒数，否则队列会长期满。
+- 记录只在内存里留最近 `queue_max_records` 条，**服务重启即清空排队与历史**。需要持久化请由外部服务自己存库，
+  本服务不承担这份职责。
+- 队列是**单进程**的：必须以单进程 uvicorn 运行（`src/main.py` 就是这样）。加 `--workers N` 会出现 N 个独立队列，
+  容量翻 N 倍且互不可见，`job_id` 也可能打到没有该记录的进程上。
+- 本服务**没有鉴权**，默认只监听 `127.0.0.1`。跨机接入请在前面加反向代理并做鉴权 / 限流，别把 7860 直接暴露到公网。
+
+#### 配置
+
+改 `config.ini` 后**重启服务**生效（环境变量优先于文件）：
+
+| 键 | 环境变量 | 默认 | 说明 |
+|---|---|---|---|
+| `queue_enabled` | `VLX_QUEUE_ENABLED` | `true` | `false` 时 `/api/queue/*` 一律 `503`，调测台功能不受影响 |
+| `queue_max_size` | `VLX_QUEUE_MAX_SIZE` | `32` | 排队上限（只算等待中），最小 1 |
+| `queue_max_records` | `VLX_QUEUE_MAX_RECORDS` | `200` | 内存保留的记录条数，超出淘汰最早结束的，最小 10 |
+| `queue_retry_after` | `VLX_QUEUE_RETRY_AFTER` | `10` | 队列超限时 `Retry-After` 的秒数 |
+
+容量怎么估：`queue_max_size ≥ 推图速率(张/秒) × 单任务耗时(秒) × 2`。比如每 5s 推一张、单任务 3s，
+排队几乎不会累积，`32` 是给模型重载 / 偶发长任务留的缓冲。
+
 ---
 
 ## 5. 本机实测（RTX 3090，demo_image.jpg 500×399，100 个候选框）
@@ -188,6 +292,7 @@
 | `VLX_WEDETECT_CHECKPOINT` | `../VLX-Seek/resources/wedetect_base_uni.pth` | WeDetect 权重 |
 | `VLX_MAX_IMAGE_SIDE` | `1280` | 上传图长边上限，0 表示不缩放 |
 | `VLX_SEEK_DEVICE` | 自动 | 如 `cuda:0` / `cpu` |
+| `VLX_QUEUE_ENABLED` / `VLX_QUEUE_MAX_SIZE` / `VLX_QUEUE_MAX_RECORDS` / `VLX_QUEUE_RETRY_AFTER` | 见 4.2 | 生产消费队列的开关与容量，覆盖 `config.ini` 里的同名 `queue_*` 键 |
 | `VLX_DEBUG_STACK` | 空 | 设为秒数可让 faulthandler 定期打印线程栈，用于排查卡死 |
 
 ---
@@ -203,13 +308,15 @@ Taozi-VLX-deepseek/
 │   │   ├── config.py           # 唯一读取环境变量与拼路径的地方（含 chdir 到 VLX-Seek）
 │   │   ├── schemas.py          # pydantic 请求模型 + ImageMeta/ModelStatus 契约
 │   │   ├── errors.py           # ApiError：services 不依赖 fastapi 的关键
-│   │   ├── protocols/          # ImageStore / ProposalSource / VisionWorker+WorkerProvider / TaskRunner
+│   │   ├── protocols/          # ImageStore / ProposalSource / VisionWorker+WorkerProvider /
+│   │   │                       # TaskRunner / JobQueue（缺一不可的抽象契约）
 │   │   ├── services/           # task_catalog 元数据、image_store、fence（围栏几何）、
 │   │   │                       # wedetect_source 候选框、model_runtime 状态机、
-│   │   │                       # task_runner 派发、suite_runner 编排
+│   │   │                       # task_runner 派发、suite_runner 编排、
+│   │   │                       # job_queue（生产消费队列：入队 / 单消费者 / 结果留存）
 │   │   ├── deps.py             # 组装根：单例在此创建，路由用 Depends 取
-│   │   ├── routers/            # meta / status / images / proposals / tasks
-│   │   └── main.py             # 应用组装：lifespan、异常翻译、静态挂载、路由注册
+│   │   ├── routers/            # meta / status / images / proposals / tasks / queue
+│   │   └── main.py             # 应用组装：lifespan（含队列启停）、异常翻译、静态挂载、路由注册
 │   ├── features/               # 业务逻辑：框架无关、无 DOM、无状态
 │   │   ├── api/http-client.js  # 注入 fetch 的 HTTP 客户端（含 ApiError）
 │   │   ├── api/vlx-api.js      # 端点适配器，UI 层唯一数据出入口
@@ -233,7 +340,7 @@ Taozi-VLX-deepseek/
 ├── _env.bat                    # run.bat / debug.bat 共用的环境变量与端口解析（导出 VLX_ENTRY）
 ├── run.bat                     # 前台启动（日志打在窗口里）
 ├── debug.bat                   # 后台启动（日志落 server.log，超 20MB 自动归档）
-├── config.ini                  # 端口/监听地址，启动器与两个 bat 共用
+├── config.ini                  # 端口/监听地址 + 队列容量（queue_*），启动器与两个 bat 共用
 ├── server.log                  # 服务日志（由 debug.bat / 启动器写入，运行时可安全忽略）
 ├── assets/launcher.ico         # 构建资源：启动器图标（PyInstaller --icon 用）
 ├── requirements.txt
