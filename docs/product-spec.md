@@ -22,24 +22,42 @@
 页面之外的第二个入口：外侧的采集服务推图进队列，服务端串行消化。它不碰 UI，只有两个动作。
 
 1. **投递**：`POST /api/queue/jobs`，multipart 带 `file`（或已上传的 `image_id`）+ `tasks`（7 个任务 id，可多个）+ 需要的 `text` / `lang` / `roi`。
-   立刻返回 `202` 和 `job_id`，**不等推理**。
+   立刻返回 `202` 和 `job_id`，**不等推理**。此时原图已经落在 `data/image_queue/`，
+   但 `image_id` 还是 `null`——图还没进图像库。
 2. **轮询**：`GET /api/queue/jobs/{job_id}`。`status` 是 `queued` / `running` 时继续等；
    进入 `succeeded` / `partially_failed` / `failed` 后，从 `results` 里按 `task` 取答案与框。
 
-投递被拒的三种情况，含义完全不同，**别一律重试**：
+**串行，不并行**：进程里只有一个消费者，一个任务跑完才取下一个。多个外部服务同时推图也只是排队，
+不会出现两个任务抢显存。
+
+**图片走两段**（磁盘上能直接看出进度）：
+
+| 阶段 | 图在哪 | `image_id` |
+|---|---|---|
+| 排队中 | `data/image_queue/{job_id}.png` | `null` |
+| 处理完 | `data/images/{image_id}.png` | 有值 |
+| 处理失败 | `data/image_queue/failed/`（带 `error`） | 有值或 `null` |
+
+投递被拒的几种情况，含义完全不同，**别一律重试**：
 
 | 返回 | 说明 | 调用方动作 |
 |---|---|---|
 | `429` + `Retry-After` | 队列已超限（`detail` 写明当前排队数与上限） | 按 `Retry-After` 退避后重投，不要立刻重试 |
 | `400` | 参数错（任务 id 不认识、`roi` 不是 JSON 数组、没给图） | 改参数，重试也没用 |
-| `503` | 队列接入被关闭（`queue_enabled=false`） | 找运维，别刷接口 |
+| `500` | 排队图写盘失败（磁盘满 / 无权限） | 找运维，重试无用 |
+| `503` | 队列接入被关闭（`queue_enabled=false`）或消费者未启动 | 找运维，别刷接口 |
 
 怎么配容量：`config.ini` 的 `queue_max_size` 是「最多缓冲多少个待处理任务」。
 推图间隔 × 单任务耗时接近 1 时队列会长期满，这时应该降低推图频率，而不是把上限调大——
-调大只是把内存里的积压变多，吞吐不会涨（单卡串行，物理约束）。
+调大只是把积压变多，吞吐不会涨（单卡串行，物理约束）。
 
-队列是**内存队列**：服务重启后排队与历史全清，`job_id` 查不到就是 `404`。
-外部服务要留痕请自己存库，别把本服务当存储。
+**重启会怎样**（第 5 轮改过，与之前不同）：
+
+- `data/image_queue/` 里没跑完的图**自动恢复重跑**，外部服务不必为「服务重启」重投；
+- 但**任务结果记录只在内存**，重启前已完成的 `job_id` 查不到（`404` 文案会说明）。
+  要留痕请自己按 `client_ref` 存库，别把本服务当存储。
+
+`failed/` 会一直长，需要定期巡检清理，流程见 `docs/deployment.md` 第 7 章。
 
 ## 2. 代码地图
 
@@ -51,10 +69,12 @@ Taozi-VLX-deepseek/
 │   ├── backend/app/
 │   │   ├── config.py             # 唯一的路径/环境变量来源（含 chdir 到 VLX-Seek）
 │   │   ├── schemas.py            # pydantic 请求模型
-│   │   ├── protocols/            # ImageStore / ProposalSource / WorkerProvider / VisionWorker / JobQueue
+│   │   ├── protocols/            # ImageStore / ProposalSource / WorkerProvider / VisionWorker /
+│   │   │                         # JobQueue / JobSpool
 │   │   ├── services/             # task_catalog（元数据）、model_runtime、wedetect_source、
 │   │   │                         # image_store、fence（围栏几何）、task_runner、suite_runner、
-│   │   │                         # job_queue（生产消费队列）
+│   │   │                         # job_spool（排队图落盘 / 失败归档）、
+│   │   │                         # job_queue（落盘入队 / 单消费者 / 重启恢复）
 │   │   ├── deps.py               # 组装根：单例在此创建，路由通过 Depends 取
 │   │   ├── routers/              # meta / status / images / proposals / tasks / queue
 │   │   └── main.py               # FastAPI 组装：lifespan（含队列启停）、静态挂载、include_router
@@ -89,9 +109,10 @@ Taozi-VLX-deepseek/
 | 围栏裁剪/过滤/灰化的几何实现 | `src/backend/app/services/fence.py` |
 | 围栏在画布上的绘制与拾取交互 | `src/web/canvas/fence-editor.js` + `src/web/canvas/annotator.js` |
 | 围栏前端校验（顶点、面积、贴合首点） | `src/features/fence/fence-geometry.js` |
-| 队列容量、超限文案、记录淘汰 | `src/backend/app/services/job_queue.py` |
+| 队列容量、超限文案、记录淘汰、重启恢复 | `src/backend/app/services/job_queue.py` |
+| 排队图的落盘 / 搬运 / 失败归档 | `src/backend/app/services/job_spool.py` |
 | 队列 HTTP 形状（表单字段解析、响应码） | `src/backend/app/routers/queue.py` |
-| 队列配置项默认值 | `src/backend/app/config.py` + `config.ini` 的 `queue_*` |
+| 队列配置项默认值、`data/` 与 `data/image_queue/` 路径 | `src/backend/app/config.py` + `config.ini` 的 `queue_*` |
 | 图片缩放与落盘 | `src/backend/app/services/image_store.py` |
 | 新增 HTTP 端点 | `src/backend/app/routers/` 下对应文件 |
 | 服务入口 / 启动参数 | `src/main.py` |

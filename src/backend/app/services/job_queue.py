@@ -1,18 +1,26 @@
-"""生产消费队列实现：外部服务投递 → 内存排队 → 单消费者串行推理 → 结果回查。
+"""生产消费队列实现：外部服务投递 → 落盘排队 → 单消费者串行推理 → 结果回查。
 
-设计取舍（三条都不是随手选的）：
+设计取舍（四条都不是随手选的）：
 
-1. **内存队列，不落盘**：本服务的推理是单卡串行（`TaskRunner` 内部有锁），队列只是
-   「把突发流量摊平」的缓冲区，不是可靠消息中间件。落盘会引入「服务崩溃后要不要重启
-   未完成任务」的语义，而中断的推理结果对调用方本来也无意义。代价是**重启丢排队任务**，
-   已在 README 与 docs/deployment 里写明。
-2. **容量只算「等待中」**：正在推理的那个不占额度。这样 `queue_max_size=1` 的含义是
+1. **串行，不并行**：整个进程只有一个消费者协程，`runner.run` 内部还有锁。同一时刻只有
+   一个任务在推理，不会出现两个任务抢显存；一个 job 里的多个 task_id 也是逐个跑。
+   队列的作用是**摊平突发流量**，不是提高吞吐。
+2. **先落盘再入队**：推上来的原图写进 `data/image_queue/`，`submit` 返回 202 时文件已经
+   在磁盘上。进程被 kill 也不丢图，重启后自动恢复重跑（见 `_recover`）。
+3. **处理完才进图像库**：排队中的图**没有 `image_id`**；消费到它时才解析、缩放、写入
+   `data/images/` 并分配 `image_id`。成功后删排队件，业务失败移到 `image_queue/failed/`。
+4. **容量只算「等待中」**：正在推理的那个不占额度。这样 `queue_max_size=1` 的含义是
    「一次只缓冲一个」，而不是「容量 1 但又能跑 1 个」这种自相矛盾的语义。
-3. **消费者跑在事件循环里、推理丢给线程**：`runner.run` 是同步阻塞（GPU 推理），
-   必须 `asyncio.to_thread`，否则一次推理就把 `/api/status` 轮询也堵死。
 
-串行策略：整个进程只有一个消费者协程，因此同一时刻只有一个任务在推理，
-不会出现两个任务抢显存；一个任务里的多个 task_id 也是逐个跑。
+两个容易写错的细节：
+
+- **容量判断必须在落盘之前**：否则队列满时已经在磁盘上留了一张没人处理的图。
+- **空闲唤醒不能丢事件**：唤醒用「先查队列 → 清标志 → 再查 → 才 await」的顺序；
+  `submit` 在「append + set」之间没有 `await`，单线程事件循环下不存在丢失窗口。
+
+中断与失败的区分（重要）：服务关停导致的中断**不算业务失败**，排队件留在原地等下次启动
+恢复；只有推理炸了、图坏了、参数错了才移到 `failed/`，避免一台机器重启一次就把整队图
+全打进失败目录。
 """
 from __future__ import annotations
 
@@ -27,6 +35,7 @@ from typing import Any, Optional
 from ..errors import ApiError
 from ..protocols.image_store import ImageStore
 from ..protocols.job_queue import JobSpec
+from ..protocols.job_spool import JobSpool
 from ..protocols.task_runner import TaskRunner
 from .task_catalog import ALL_TASKS, get_task
 
@@ -39,6 +48,8 @@ STATUS_FAILED = "failed"
 
 _TERMINAL_STATUSES = (STATUS_SUCCEEDED, STATUS_PARTIAL, STATUS_FAILED)
 _LIST_LIMIT_MAX = 200
+_IMAGE_SOURCE_UPLOAD = "upload"
+_IMAGE_SOURCE_EXISTING = "existing"
 
 
 def _now_iso() -> str:
@@ -46,17 +57,23 @@ def _now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-class InMemoryJobQueue:
-    """`JobQueue` 的进程内实现：deque 排队 + 单个消费者协程。
+class SpoolBackedJobQueue:
+    """`JobQueue` 的默认实现：磁盘排队（`JobSpool`）+ 单消费者协程 + 内存结果留存。
 
     线程模型：`submit` / `get` / `status` 都在事件循环线程上执行，deque 与 dict 无需加锁；
     唯一离开事件循环的是 `runner.run`（`asyncio.to_thread`）。
+
+    状态分布：
+        排队中的图与参数   → `data/image_queue/`（进程重启不丢）
+        任务记录与结果     → 进程内存（重启清空，`get` 返回 404）
+        处理完的图         → `data/images/`（由 `ImageStore` 管）
     """
 
     def __init__(
         self,
         runner: TaskRunner,
         image_store: ImageStore,
+        spool: JobSpool,
         *,
         capacity: int = 32,
         max_records: int = 200,
@@ -66,14 +83,16 @@ class InMemoryJobQueue:
         """
         入参：
             runner: 任务执行器（同步阻塞，内部自己保证串行）。
-            image_store: 图片落盘与读取；外部服务推图时由本类代存。
+            image_store: 图像库；消费阶段把排队图落进 `data/images/`。
+            spool: 排队目录；`submit` 写、消费读、成功删、失败转 `failed/`。
             capacity: 排队上限（只算等待中的任务），最小 1。
             max_records: 内存里保留的任务记录条数上限，超出淘汰最早结束的。
             retry_after: 队列超限时回给外部服务的建议重试秒数（同时写进 `Retry-After` 头）。
-            enabled: 关闭后 `submit` 一律 503，`start` 不启动消费者。
+            enabled: 关闭后 `submit` 一律 503，`start` 不启动消费者、也不做恢复。
         """
         self._runner = runner
         self._store = image_store
+        self._spool = spool
         self._capacity = max(1, int(capacity))
         self._max_records = max(10, int(max_records))
         self._retry_after = max(1, int(retry_after))
@@ -81,7 +100,7 @@ class InMemoryJobQueue:
 
         self._pending: deque[str] = deque()  # 等待中的 job_id（队首最先被消费）
         self._records: dict[str, dict[str, Any]] = {}  # job_id -> 快照（对外可见）
-        self._specs: dict[str, JobSpec] = {}  # job_id -> 原始入参（内部用，不对外）
+        self._specs: dict[str, dict[str, Any]] = {}  # job_id -> 排队元信息（内部用，不对外）
         self._finished: deque[str] = deque()  # 已结束的 job_id，用于淘汰
 
         self._wakeup = asyncio.Event()
@@ -89,6 +108,7 @@ class InMemoryJobQueue:
         self._current: Optional[str] = None
 
         self._submitted_total = 0
+        self._recovered_total = 0
         self._succeeded_total = 0
         self._failed_total = 0
         self._rejected_total = 0
@@ -104,7 +124,7 @@ class InMemoryJobQueue:
 
         tasks = self._normalize_tasks(spec)
 
-        # 先判容量再落盘：队列满了就不该在磁盘上留一张没人用的图
+        # 先判容量再落盘：队列满了就不该在磁盘上留一张没人处理的图
         if len(self._pending) >= self._capacity:
             self._rejected_total += 1
             raise ApiError(
@@ -116,30 +136,49 @@ class InMemoryJobQueue:
                 headers={"Retry-After": str(self._retry_after)},
             )
 
-        image_id, image_meta = self._resolve_image(spec)
-
+        image_source, image_id, image_meta, filename = self._resolve_image(spec)
         job_id = uuid.uuid4().hex[:12]
-        position = len(self._pending) + 1
+        submitted_at = _now_iso()
+
+        # 落盘：原图 + sidecar。返回 202 时文件已经在磁盘上，重启可恢复
+        meta: dict[str, Any] = {
+            "tasks": list(tasks),
+            "params": self._params_from_spec(spec),
+            "image_source": image_source,
+            "image_id": image_id,
+            "filename": filename,
+            "client_ref": spec.get("client_ref"),
+            "submitted_at": submitted_at,
+            "attempts": 0,
+        }
+        queued_file = self._spool.put(
+            job_id, image_bytes=spec.get("image_bytes"), filename=filename, meta=meta
+        )
+
         record: dict[str, Any] = {
             "job_id": job_id,
             "status": STATUS_QUEUED,
-            "position": position,
+            "position": len(self._pending) + 1,
             "tasks": list(tasks),
+            "image_source": image_source,
             "image_id": image_id,
             "image": image_meta,
+            "queued_file": queued_file,
             "client_ref": spec.get("client_ref"),
-            "submitted_at": _now_iso(),
+            "submitted_at": submitted_at,
             "started_at": None,
             "finished_at": None,
             "queue_wait_ms": None,
             "elapsed_ms": None,
+            "attempts": 0,
+            "recovered": False,
             "progress": {"done": 0, "total": len(tasks)},
             "results": [],
             "error": None,
             "capacity": self._capacity,
         }
         self._records[job_id] = record
-        self._specs[job_id] = dict(spec, tasks=list(tasks), image_id=image_id)  # type: ignore[typeddict-item]
+        self._specs[job_id] = meta
         self._pending.append(job_id)
         self._wakeup.set()
         self._submitted_total += 1
@@ -151,7 +190,8 @@ class InMemoryJobQueue:
         if record is None:
             raise ApiError(
                 404,
-                f"任务不存在或已被淘汰：{job_id}（内存只保留最近 {self._max_records} 条记录）。",
+                f"任务不存在或已被淘汰：{job_id}（服务只保留最近 {self._max_records} 条记录，"
+                "重启也会清空；排队中的图仍在 data/image_queue/ 里，重启后自动重跑）。",
             )
         return self._public(job_id, record)
 
@@ -188,20 +228,23 @@ class InMemoryJobQueue:
             "retained": len(self._records),
             "max_records": self._max_records,
             "submitted_total": self._submitted_total,
+            "recovered_total": self._recovered_total,
             "succeeded_total": self._succeeded_total,
             "failed_total": self._failed_total,
             "rejected_total": self._rejected_total,
             "tasks_run": self._tasks_run,
+            "spool": self._spool.stats(),
         }
 
     async def start(self) -> None:
-        """见 `JobQueue.start`。"""
+        """见 `JobQueue.start`。启动前先把上次没跑完的排队件恢复进来。"""
         if not self._enabled or self._consumer is not None:
             return
+        self._recover()
         self._consumer = asyncio.create_task(self._consume(), name="vlx-job-queue")
 
     async def stop(self) -> None:
-        """见 `JobQueue.stop`。"""
+        """见 `JobQueue.stop`。中断的任务**不搬** `failed/`，排队件留给下次启动恢复。"""
         consumer, self._consumer = self._consumer, None
         if consumer is not None:
             consumer.cancel()
@@ -212,7 +255,7 @@ class InMemoryJobQueue:
             record = self._records.get(current)
             if record is not None and record["status"] == STATUS_RUNNING:
                 record["status"] = STATUS_FAILED
-                record["error"] = "服务关闭，任务中断。"
+                record["error"] = "服务关闭，任务中断（排队件已保留，下次启动会重新处理）。"
                 record["finished_at"] = _now_iso()
                 self._failed_total += 1
 
@@ -240,8 +283,8 @@ class InMemoryJobQueue:
     async def _execute(self, job_id: str) -> None:
         """串行跑完一个任务的所有 task_id，逐条记录结果，写回最终状态。"""
         record = self._records.get(job_id)
-        spec = self._specs.get(job_id)
-        if record is None or spec is None:
+        meta = self._specs.get(job_id)
+        if record is None or meta is None:
             return
 
         self._current = job_id
@@ -249,13 +292,22 @@ class InMemoryJobQueue:
         record["position"] = 1
         record["started_at"] = _now_iso()
         record["queue_wait_ms"] = _since_ms(str(record["submitted_at"]))
-        payload = self._payload(spec)
         started = time.perf_counter()
 
         interrupted = False
         try:
-            for task_id in record["tasks"]:
-                await self._run_one(record, task_id, payload)
+            record["attempts"] = int(record.get("attempts") or 0) + 1
+            self._spool.update(job_id, {"attempts": record["attempts"]})
+
+            # 排队图在这一步才进图像库：解析 → 缩放 → 写 data/images/ → 拿到 image_id
+            try:
+                self._materialize(job_id, record, meta)
+            except ApiError as exc:
+                record["error"] = exc.detail
+            else:
+                payload = self._payload(meta, record.get("image_id"))
+                for task_id in record["tasks"]:
+                    await self._run_one(record, task_id, payload)
         except asyncio.CancelledError:
             # 关停时取消：正在推理的线程收不回来，但状态必须变成终态，
             # 否则外部服务会一直轮询一个永远 running 的任务
@@ -267,7 +319,37 @@ class InMemoryJobQueue:
             self._finalize(record, interrupted=interrupted)
             self._current = None
             self._finished.append(job_id)
+            self._settle_spool(job_id, record, interrupted=interrupted)
             self._evict()
+
+    def _materialize(
+        self, job_id: str, record: dict[str, Any], meta: dict[str, Any]
+    ) -> None:
+        """把排队中的图搬进图像库，成功时回填 `image_id`。
+
+        入参：`job_id` 为任务 id；`record` 为对外快照（就地回填）；`meta` 为排队元信息。
+        返回：无。
+        异常：排队件缺失抛 `ApiError(410)`；图片无法解析抛 `ApiError(400)`。
+        边界：
+            - `image_source=existing`（复用图像库已有的图）不搬，只校验 `image_id` 存在；
+            - 崩溃恢复时若上次已经搬过（`images/` 里已有该 id），跳过重复搬运，避免一张图存两份。
+        """
+        source = meta.get("image_source")
+        if source != _IMAGE_SOURCE_UPLOAD:
+            image_id = str(record.get("image_id") or "")
+            if not image_id:
+                raise ApiError(410, f"排队记录缺少 image_id：{job_id}，请重新投递。")
+            return
+
+        previous = str(record.get("image_id") or "")
+        if previous and self._store.path(previous).is_file():
+            return
+
+        raw = self._spool.read_image(job_id)
+        image_meta = self._store.create_from_bytes(raw, str(meta.get("filename") or "queue-upload"))
+        record["image_id"] = image_meta["image_id"]
+        record["image"] = dict(image_meta)
+        self._spool.update(job_id, {"image_id": image_meta["image_id"]})
 
     async def _run_one(
         self, record: dict[str, Any], task_id: str, payload: dict[str, Any]
@@ -331,16 +413,35 @@ class InMemoryJobQueue:
             }
         )
 
+    def _settle_spool(self, job_id: str, record: dict[str, Any], *, interrupted: bool) -> None:
+        """按终态处置排队件：成功删除、业务失败移 `failed/`、中断原地保留。
+
+        入参：`interrupted` 为 True 表示服务关停导致的取消，此时**不动磁盘**，
+             排队件留给下次 `start()` 恢复重跑。
+        """
+        if interrupted:
+            return
+        if record["status"] in (STATUS_SUCCEEDED, STATUS_PARTIAL):
+            self._spool.discard(job_id)
+            return
+        self._spool.fail(job_id, str(record.get("error") or "任务失败。"))
+
     def _finalize(self, record: dict[str, Any], interrupted: bool = False) -> None:
         """按「全部成功 / 部分成功 / 全部失败 / 关停中断」定终态，并累加计数。"""
         results = record["results"]
         if interrupted:
             record["status"] = STATUS_FAILED
-            record["error"] = "服务关闭，任务中断。"
+            record["error"] = "服务关闭，任务中断（排队件已保留，下次启动会重新处理）。"
+            self._failed_total += 1
+            return
+        if not results:
+            # 材料化阶段就失败了（图坏了、排队件被清理），没有逐任务结果可看
+            record["status"] = STATUS_FAILED
+            record["error"] = record.get("error") or "没有可执行的任务。"
             self._failed_total += 1
             return
         ok_count = sum(1 for item in results if item["ok"])
-        if ok_count == len(results) and results:
+        if ok_count == len(results):
             record["status"] = STATUS_SUCCEEDED
             self._succeeded_total += 1
         elif ok_count:
@@ -349,8 +450,64 @@ class InMemoryJobQueue:
             self._failed_total += 1
         else:
             record["status"] = STATUS_FAILED
-            record["error"] = results[0]["error"] if results else "没有可执行的任务。"
+            record["error"] = results[0]["error"] or "任务全部失败。"
             self._failed_total += 1
+
+    def _recover(self) -> int:
+        """把 `image_queue/` 里上次没跑完的记录重新排队（按提交时间升序）。
+
+        返回：恢复的条数。
+        边界：
+            - 任务 id 已不存在（比如任务目录被删）的记录直接移进 `failed/`，不进队列空转；
+            - 记录损坏（`tasks` 为空）同样进 `failed/`，不做猜测性修复；
+            - 恢复的条数不受 `capacity` 限制——这些是已经被接受、已经回 202 的任务，
+              拒掉会让外部服务拿到「已接收但永不出结果」的鬼状态。代价是启动后队列可能
+              暂时超水位，`submit` 会一直 429 直到消化到水位以下，这是正确行为。
+        """
+        restored = 0
+        for entry in self._spool.list_entries():
+            job_id = str(entry.get("job_id") or "")
+            if not job_id or job_id in self._records:
+                continue
+            tasks = [str(item) for item in (entry.get("tasks") or []) if str(item).strip()]
+            if not tasks:
+                self._spool.fail(job_id, "排队记录损坏：tasks 为空。")
+                continue
+            unknown = [task for task in tasks if get_task(task) is None]
+            if unknown:
+                self._spool.fail(job_id, f"排队记录里的任务 id 已不存在：{', '.join(unknown)}。")
+                continue
+
+            record: dict[str, Any] = {
+                "job_id": job_id,
+                "status": STATUS_QUEUED,
+                "position": len(self._pending) + 1,
+                "tasks": tasks,
+                "image_source": entry.get("image_source") or _IMAGE_SOURCE_UPLOAD,
+                "image_id": entry.get("image_id"),
+                "image": None,
+                "queued_file": entry.get("image_file"),
+                "client_ref": entry.get("client_ref"),
+                "submitted_at": entry.get("submitted_at") or _now_iso(),
+                "started_at": None,
+                "finished_at": None,
+                "queue_wait_ms": None,
+                "elapsed_ms": None,
+                "attempts": int(entry.get("attempts") or 0),
+                "recovered": True,
+                "progress": {"done": 0, "total": len(tasks)},
+                "results": [],
+                "error": None,
+                "capacity": self._capacity,
+            }
+            self._records[job_id] = record
+            self._specs[job_id] = dict(entry)
+            self._pending.append(job_id)
+            self._recovered_total += 1
+            restored += 1
+        if restored:
+            self._wakeup.set()
+        return restored
 
     def _evict(self) -> None:
         """按结束顺序淘汰老记录，保证内存占用有上限。"""
@@ -377,23 +534,31 @@ class InMemoryJobQueue:
             raise ApiError(400, f"未知任务 id：{', '.join(unknown)}，可选：{available}。")
         return tasks
 
-    def _resolve_image(self, spec: JobSpec) -> tuple[str, Optional[dict[str, Any]]]:
-        """确定本次任务用哪张图：优先用推上来的字节，其次复用 `image_id`。"""
+    def _resolve_image(
+        self, spec: JobSpec
+    ) -> tuple[str, Optional[str], Optional[dict[str, Any]], str]:
+        """确定本次任务用哪张图，返回 `(来源, image_id, 元信息, 原始文件名)`。
+
+        边界：优先用推上来的字节（`upload`），此时 `image_id` 为 None，处理阶段才生成；
+             其次复用 `image_id`（`existing`），图已经在 `data/images/` 里。
+        异常：两者都没给抛 `ApiError(400)`；`image_id` 不存在抛 `ApiError(404)`。
+        """
         raw = spec.get("image_bytes")
+        filename = spec.get("filename") or "queue-upload"
         if raw:
-            meta = self._store.create_from_bytes(bytes(raw), spec.get("filename") or "queue-upload")
-            return str(meta["image_id"]), dict(meta)
+            return _IMAGE_SOURCE_UPLOAD, None, None, filename
+
         image_id = str(spec.get("image_id") or "").strip()
         if not image_id:
             raise ApiError(400, "缺少图片：multipart 里必须给 file（直接推图）或 image_id（复用已上传图）。")
         if not self._store.path(image_id).is_file():
             raise ApiError(404, f"图片不存在或已过期：{image_id}")
-        return image_id, None
+        return _IMAGE_SOURCE_EXISTING, image_id, None, filename
 
-    def _payload(self, spec: JobSpec) -> dict[str, Any]:
-        """拼出与 `RunRequest` 同构的 payload（None 原样传，执行器会回落到任务默认值）。"""
+    @staticmethod
+    def _params_from_spec(spec: JobSpec) -> dict[str, Any]:
+        """从投递参数里抽出可 JSON 序列化的执行参数（落进 sidecar，重启后原样回放）。"""
         return {
-            "image_id": spec.get("image_id"),
             "text": spec.get("text"),
             "lang": spec.get("lang"),
             "bbox_list": spec.get("bbox_list"),
@@ -404,6 +569,13 @@ class InMemoryJobQueue:
             "temperature": spec.get("temperature"),
             "top_p": spec.get("top_p"),
         }
+
+    @staticmethod
+    def _payload(meta: dict[str, Any], image_id: Optional[str]) -> dict[str, Any]:
+        """拼出与 `RunRequest` 同构的 payload（None 原样传，执行器会回落到任务默认值）。"""
+        payload = dict(meta.get("params") or {})
+        payload["image_id"] = image_id
+        return payload
 
     def _public(self, job_id: str, record: dict[str, Any]) -> dict[str, Any]:
         """对外快照：补上会变的 `position`，丢掉内部字段（`spec` 不落进响应）。"""

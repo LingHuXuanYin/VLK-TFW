@@ -160,11 +160,17 @@
 
 ```
 外部服务                                本服务
-   │  POST /api/queue/jobs  ─────────▶  参数校验 → 入队 → 202 {job_id}
-   │                                    ↓ 单消费者串行推理（GPU 同一时刻只跑一个任务）
+   │  POST /api/queue/jobs  ─────────▶  校验 → 原图落 data/image_queue/ → 202 {job_id}
+   │                                    ↓ 单消费者串行（GPU 同一时刻只跑一个任务）
+   │                                    ↓ 轮到它：解析 → 搬进 data/images/ → 拿 image_id → 推理
+   │                                    ↓ 成功删排队件 / 业务失败移 image_queue/failed/
    │  GET /api/queue/jobs/{job_id} ───▶  queued / running / succeeded / partially_failed / failed
    │                                    ↓ 终态后读 results
 ```
+
+**串行不是并行**：整个进程只有一个消费者协程，一个任务跑完才取下一个。好处是显存不会互抢、
+长任务（`reasoning_detection` 实测 44.5s）不会被后来的请求拖慢；代价是吞吐上限就是
+「单任务耗时」的倒数，推图频率超过它就只会让队列变长。
 
 #### 投递
 
@@ -180,8 +186,10 @@ curl -X POST http://127.0.0.1:7860/api/queue/jobs \
 ```json
 {
   "ok": true, "job_id": "9f3c1a77b0d2", "status": "queued", "position": 1,
-  "capacity": 32, "tasks": ["detection"], "image_id": "421608b7bc4a",
-  "client_ref": "cam-01/20261102-1030", "submitted_at": "2026-11-02T10:30:11+08:00"
+  "capacity": 32, "tasks": ["detection"], "image_source": "upload",
+  "image_id": null, "queued_file": "9f3c1a77b0d2.png",
+  "client_ref": "cam-01/20261102-1030", "submitted_at": "2026-11-02T10:30:11+08:00",
+  "attempts": 0, "recovered": false, "progress": {"done": 0, "total": 1}
 }
 ```
 
@@ -195,6 +203,26 @@ curl -X POST http://127.0.0.1:7860/api/queue/jobs \
 | `bbox_list` / `roi` / `target_region_indexes` | 传 **JSON 字符串**；`roi` 是电子围栏（见 4.1），区域任务必须给 `target_region_indexes` |
 | `client_ref` | 调用方自己的业务主键，原样回显，便于对账 |
 
+响应里的 `image_source` / `image_id` / `queued_file` 是**排队期**的身份，含义见下一小节。
+
+#### 图片的两段式身份（容易误解，务必看）
+
+**投递成功 ≠ 图已在图像库**，只等于「已收下并排队」：
+
+| 阶段 | 图在哪 | `image_id` |
+|---|---|---|
+| 已投递、排队中 | `data/image_queue/{job_id}.png` | `null`，看 `queued_file` |
+| 轮到它处理 | 搬进 `data/images/{image_id}.png` | 有值，`GET /jobs/{id}` 里能看到 |
+| 处理成功 | 留在 `data/images/` | 有值，可再用 `image_id` 投递 |
+| 处理失败 | 移入 `data/image_queue/failed/` | 有值或 `null`，sidecar 里带 `error` |
+
+`image_source` 两种取值：`upload`（直接推图，原图从 `image_queue/` 搬过来）与
+`existing`（用 `image_id` 复用图像库已有的图，不搬、不复制）。
+
+**重启怎么办**：`data/image_queue/` 里没跑完的图会在下次启动时**自动恢复重跑**，
+所以外部服务不需要为「服务重启」重投。但**任务结果记录只在内存**，重启后 `GET /jobs/{id}`
+返回 `404`——要结果就得在重启前取走，或者自己按 `client_ref` 存库。
+
 响应码语义（调用方按这个分支处理，不要一律重试）：
 
 | 码 | 含义 | 该怎么做 |
@@ -203,6 +231,7 @@ curl -X POST http://127.0.0.1:7860/api/queue/jobs \
 | `400` | 参数错：未知任务 id / JSON 字段格式错 / 没给图片 | **别重试**，改参数 |
 | `404` | `image_id` 指向的图不存在或已过期 | 重新上传，或改用 `file` |
 | `429` | **队列已超限**，`detail` 写明当前排队数与上限 | 按响应头 `Retry-After` 退避后重投 |
+| `500` | 排队图写盘失败（磁盘满 / 无权限） | 找运维，重试无用 |
 | `503` | 队列接入被关闭（`queue_enabled=false`）或消费者未启动 | 查 `/api/queue/status`，找运维 |
 
 #### 取结果
@@ -230,9 +259,19 @@ curl -X POST http://127.0.0.1:7860/api/queue/jobs \
 #### 队列规则（决定容量怎么配）
 
 - **上限只算「等待中」的任务**，正在推理的那个不占额度。`queue_max_size=1` 的含义是「一次只缓冲一个」。
-- 队列满直接 `429`，**不阻塞、不排队、不落盘**，HTTP 线程立刻释放。
+- 队列满直接 `429`，**不阻塞、不排队、不落盘**（容量判断在写磁盘之前），HTTP 线程立刻释放。
+- **先落盘再入队**：推上来的图先写进 `data/image_queue/`，`202` 返回时文件已经在磁盘上。
+  进程被 kill 也不丢图，下次启动自动重跑。
+- **处理完才进图像库**：排队中的图没有 `image_id`；消费到它时才解析、缩放、写入 `data/images/`。
+  成功后删排队件，**业务失败**（推理炸 / 图坏了 / 参数错）移进 `data/image_queue/failed/`。
+- **服务关停导致的中断不算业务失败**：排队件原地保留，下次启动重跑。只有业务失败才进 `failed/`，
+  否则机器重启一次就把整队图全打进失败目录。
 - 进程内只有**一个消费者**，同一时刻只跑一个任务（10B 模型并行只会互相抢显存）。所以队列的作用是
   **把突发流量摊平**，不是提高吞吐：外部服务推图频率必须低于「单任务平均耗时」的倒数，否则队列会长期满。
+- **启动恢复不受 `capacity` 限制**：重启后可能短暂超水位，此时新投递会一直 `429` 直到消化下来——
+  这是对的，已经回过 `202` 的任务不能因为重启被丢掉。
+- `GET /api/queue/status` 的 `spool` 字段是磁盘水位：`pending` 待处理文件数、`failed` 失败件数、
+  `bytes` 占用字节数。`failed/` 会持续增长，清理方式见 `docs/deployment.md`。
 - 记录只在内存里留最近 `queue_max_records` 条，**服务重启即清空排队与历史**。需要持久化请由外部服务自己存库，
   本服务不承担这份职责。
 - 队列是**单进程**的：必须以单进程 uvicorn 运行（`src/main.py` 就是这样）。加 `--workers N` 会出现 N 个独立队列，
@@ -252,6 +291,10 @@ curl -X POST http://127.0.0.1:7860/api/queue/jobs \
 
 容量怎么估：`queue_max_size ≥ 推图速率(张/秒) × 单任务耗时(秒) × 2`。比如每 5s 推一张、单任务 3s，
 排队几乎不会累积，`32` 是给模型重载 / 偶发长任务留的缓冲。
+
+磁盘怎么估：排队目录常驻 ≈ 「当前排队张数 × 单张大小」。1280 长边的 JPEG 通常 0.2~0.5MB，
+`queue_max_size=32` 时 `data/image_queue/` 一般不到 20MB，不用特意管。
+真正会长的是 `data/image_queue/failed/`——它没有上限，清理方式见 [9. 部署](#9-部署) 与 `docs/deployment.md`。
 
 ---
 
@@ -309,11 +352,12 @@ Taozi-VLX-deepseek/
 │   │   ├── schemas.py          # pydantic 请求模型 + ImageMeta/ModelStatus 契约
 │   │   ├── errors.py           # ApiError：services 不依赖 fastapi 的关键
 │   │   ├── protocols/          # ImageStore / ProposalSource / VisionWorker+WorkerProvider /
-│   │   │                       # TaskRunner / JobQueue（缺一不可的抽象契约）
+│   │   │                       # TaskRunner / JobQueue / JobSpool（缺一不可的抽象契约）
 │   │   ├── services/           # task_catalog 元数据、image_store、fence（围栏几何）、
 │   │   │                       # wedetect_source 候选框、model_runtime 状态机、
 │   │   │                       # task_runner 派发、suite_runner 编排、
-│   │   │                       # job_queue（生产消费队列：入队 / 单消费者 / 结果留存）
+│   │   │                       # job_spool（排队图落盘 / 失败件归档）、
+│   │   │                       # job_queue（落盘入队 / 单消费者 / 重启恢复 / 结果留存）
 │   │   ├── deps.py             # 组装根：单例在此创建，路由用 Depends 取
 │   │   ├── routers/            # meta / status / images / proposals / tasks / queue
 │   │   └── main.py             # 应用组装：lifespan（含队列启停）、异常翻译、静态挂载、路由注册
@@ -344,8 +388,11 @@ Taozi-VLX-deepseek/
 ├── server.log                  # 服务日志（由 debug.bat / 启动器写入，运行时可安全忽略）
 ├── assets/launcher.ico         # 构建资源：启动器图标（PyInstaller --icon 用）
 ├── requirements.txt
-├── docs/                       # requirements.md / product-spec.md / iteration-report.md
-└── data/images/                # 运行时数据：上传图 + 候选框缓存（可随时删除）
+├── docs/                       # requirements / product-spec / deployment / iteration-report
+├── data/
+│   ├── images/                 # 处理完的图 + 候选框缓存（可随时删除，只影响历史回看）
+│   └── image_queue/            # 排队中未处理的图（删掉 = 丢任务，别手清）
+│       └── failed/             # 业务失败的图 + 错误原因（会持续增长，按 docs/deployment.md 清理）
 ```
 
 **为什么这么分**：`src/` 内全部是「可执行 / 可加载」的源码与前端资源；项目根只留启动脚本、配置、
@@ -372,7 +419,89 @@ URL 前缀与重构前一致，前端无需改 import；前端用相对路径 im
 | 常量 | 值 | 用途 |
 |---|---|---|
 | `SRC_ROOT` | `src/` | 源码根：`WEB_DIR` / `FEATURES_DIR` / `SHARED_DIR` 都基于它 |
-| `PROJECT_ROOT` | 项目根 | 运行时产物：`data/images`、`config.ini`、`server.log` |
+| `PROJECT_ROOT` | 项目根 | 运行时产物：`data/`、`config.ini`、`server.log` |
+| `DATA_DIR` | `data/images` | 处理完的图 + 候选框缓存（可随时删，只影响历史回看） |
+| `IMAGE_QUEUE_DIR` | `data/image_queue` | 排队中的图 + 失败件（**删掉等于丢任务**，只能按 failed/ 记录确认后清） |
 
 启动入口对应关系：`run.bat` / `debug.bat` 调用 `%PY% "%VLX_ENTRY%"`（= `src\main.py`），
 `启动器.exe` 直接以 `src/main.py` 为参数拉起；三者 cwd 都是项目根。
+
+---
+
+## 9. 部署
+
+本服务是**本机单实例服务**（10B 模型 + WeDetect 权重常驻显存），不是无状态 Web 应用。所以「部署」
+= 准备环境 + 起进程 + 配 `config.ini`，没有容器化、没有多副本、没有反向代理。
+完整细节（环境矩阵、发布流程、回滚、故障处置）见 [`docs/deployment.md`](docs/deployment.md)，
+本节只保留当前生效的步骤。
+
+### 9.1 环境要求
+
+| 项 | 要求 |
+|---|---|
+| 操作系统 | Windows 10/11 x64（`run.bat` / `debug.bat` / 启动器都是 cmd 体系） |
+| Python | 用 `../VLX-Seek/.venv`（3.10），**不另建虚拟环境**——`_env.bat` 把 `PY` 写死指向它 |
+| 显存 | ≥ 20GB；实测 RTX 3090 加载后占 22.6/24.5GB，所以**只能跑一个实例** |
+| 磁盘 | 模型权重约 20GB；`data/` 可随时删，`data/image_queue/failed/` 需定期巡检 |
+| 目录布局 | `VLX-program/` 下必须有 `VLX-Seek/` 与 `Taozi-VLX-deepseek/` 两个同级目录 |
+
+### 9.2 启动（三选一）
+
+| 入口 | 行为 | 什么时候用 |
+|---|---|---|
+| `debug.bat` | 后台启动，日志写 `server.log`，超 20MB 自动归档 | 日常 / 交付现场 |
+| `run.bat` | 前台启动，日志打在窗口里 | 排障，需要实时看输出 |
+| `启动器.exe` | 图形界面：改端口、启停、看状态与日志 | 给非技术同事用 |
+
+三个入口的 cwd 都是项目根，都从 `config.ini` 取端口。**端口优先级：命令行参数 > 环境变量 `PORT` > `config.ini` > 7860**。
+
+> `启动器.exe` 是 `src/launcher.py` 的打包产物。**改过 `launcher.py` 就必须重跑 `build_launcher.bat`**，
+> 否则 exe 里还是旧逻辑（比如改端口会把 `queue_*` 配置抹掉）。
+
+### 9.3 配置
+
+改 `config.ini` 后**重启服务**生效，环境变量优先于文件：
+
+| 键 | 环境变量 | 默认 | 说明 |
+|---|---|---|---|
+| `port` | `PORT` | `7860` | 监听端口 |
+| `host` | `HOST` | `127.0.0.1` | 监听地址；改 `0.0.0.0` 才能跨机访问（需自行加鉴权/限流） |
+| `queue_enabled` | `VLX_QUEUE_ENABLED` | `true` | `false` 时 `/api/queue/*` 一律 503 |
+| `queue_max_size` | `VLX_QUEUE_MAX_SIZE` | `32` | 排队上限（只算等待中） |
+| `queue_max_records` | `VLX_QUEUE_MAX_RECORDS` | `200` | 内存保留的任务记录数 |
+| `queue_retry_after` | `VLX_QUEUE_RETRY_AFTER` | `10` | 429 的 `Retry-After` 秒数 |
+
+其余模型相关环境变量见 [7. 环境变量](#7-环境变量)。
+
+### 9.4 起完验证
+
+```bash
+curl http://127.0.0.1:7860/api/status        # model_state 最终应为 ready
+curl http://127.0.0.1:7860/api/queue/status  # consumer_running=true，spool 三项为磁盘水位
+```
+
+浏览器打开 `http://127.0.0.1:7860/docs` 应看到 12 条 `/api` 路径（含 `queue` 那 4 个操作）。
+
+### 9.5 运行时目录与清理
+
+| 目录 | 内容 | 能不能删 |
+|---|---|---|
+| `data/images/` | 处理完的图 + 候选框缓存 | **可以**，删了只影响历史回看 |
+| `data/image_queue/` | 排队中未处理的图 + sidecar | **不要手删**，删了等于丢任务 |
+| `data/image_queue/failed/` | 业务失败的图 + 错误原因 | 可以，但先看 sidecar 的 `error` 再清 |
+
+`failed/` 是唯一会持续增长的目录（无上限）。清理步骤：停服务 → 看 `failed/*.json` 的 `error` →
+确认是坏图/参数错之后整目录清空 → 启服务。带告警的巡检脚本见 `docs/deployment.md`。
+
+### 9.6 升级与回滚
+
+```bash
+git pull origin master        # 升级
+git checkout <commit>         # 回滚
+```
+
+- 只改了 Python / 前端：重启服务即生效，不用重装依赖。
+- 改了 `requirements.txt`：先 `pip install -r requirements.txt`，再重启。
+- 改了 `src/launcher.py`：额外跑一次 `build_launcher.bat`。
+- 回滚到「还没有队列功能」的版本前，先把 `data/image_queue/` 里的排队件处理完或整目录挪走——
+  旧版本不认识这个目录，图会一直躺着没人处理。

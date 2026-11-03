@@ -220,3 +220,75 @@
 | 关停留下永远 `running` 的记录 | 取消时走 `_finalize(interrupted=True)` → `failed` |
 | 启动器改端口把 `queue_*` 抹掉 | `save_config` 改为只改 `port`/`host`，其余行原样保留 |
 | 空闲唤醒丢事件（消费者睡死） | 唤醒用「先查队列 → 清标志 → 再查 → 才 await」，单线程事件循环下无丢唤醒窗口 |
+
+---
+
+## 9. 第 5 轮范围：排队图落盘（`image_queue/`）与重启恢复
+
+### 9.1 背景
+
+第 4 轮的队列把「排队中的图」放在**进程内存**里（`JobSpec.image_bytes` 挂在 `_specs` 上），
+而且**投递那一刻就把图写进了 `data/images/`**。两个问题：
+
+1. **语义错位**：`data/images/` 的约定是「处理完的图」，排队中的图也在里面，等于把「已入库」
+   与「待处理」混成一层。要看「还有多少没处理」只能查接口，磁盘上看不出来。
+2. **重启丢图**：内存队列一停就清空，已经回过 `202` 的图直接消失，外部服务只能干等到超时再重投。
+
+本轮把排队图搬到独立目录，并让重启能接着处理。
+
+### 9.2 做法
+
+| 环节 | 位置 | 做法 |
+|---|---|---|
+| 缓冲层 | `services/job_spool.py` + `protocols/job_spool.py` | 新增 `JobSpool` 契约：`put` / `read_image` / `read` / `update` / `discard` / `fail` / `list_entries` / `stats` |
+| 投递 | `job_queue.submit` | 容量校验 → 原图写 `image_queue/{job_id}.<ext>` + sidecar → `202`（`image_id` 为 `null`） |
+| 消费 | `job_queue._materialize` | 读原图 → 解析/缩放 → 写 `data/images/` → 回填 `image_id` 到记录与 sidecar |
+| 成功 | `job_queue._settle_spool` | `succeeded` / `partially_failed` → 删排队件 |
+| 业务失败 | 同上 | 移到 `image_queue/failed/`，sidecar 追加 `error` / `failed_at` |
+| 关停中断 | 同上 | **不搬**，原地保留，下次启动重跑 |
+| 恢复 | `job_queue._recover` | 启动时按 `submitted_at` 升序扫描 sidecar 重新入队 |
+
+### 9.3 契约变更
+
+| 层 | 变更 |
+|---|---|
+| `protocols/job_spool.py` | 新增 `JobSpool` + `SpoolEntry` |
+| `protocols/job_queue.py` | `submit` 返回值新增 `queued_file` / `image_source`；`image_id` 语义改为「处理后才有的图像库身份」；`status` 新增 `recovered_total` 与 `spool{pending,failed,bytes}` |
+| `config.py` | 新增 `IMAGE_QUEUE_DIR`（`data/image_queue`） |
+| `deps.py` | 新增 `LocalJobSpool` 单例并注入队列 |
+| `services/job_queue.py` | 类名 `InMemoryJobQueue` → `SpoolBackedJobQueue`（原名已不准确） |
+
+### 9.4 验收标准
+
+1. **投递只落排队目录**：`202` 后 `data/image_queue/` 出现 `{job_id}.json` 与 `{job_id}.png`，
+   `data/images/` 没有新增文件，响应 `image_id` 为 `null`。
+2. **处理完才进图像库**：终态 `succeeded` 后 `data/images/` 出现该图，`image_queue/` 清空，
+   记录里 `image_id` 有值且等于落盘文件名。
+3. **串行不变**：并发峰值恒为 1。
+4. **业务失败归档**：推理抛错、图片无法解析 → `failed/` 下有 sidecar 与原图，sidecar 带 `error`；
+   排队目录里已清掉。
+5. **超限不落盘**：队列满时 `429`，`image_queue/` 文件数不变。
+6. **重启恢复**：停止消费者后重建队列实例，`start` 会把残留记录重新入队并跑完，
+   `recovered_total` 与文件数一致。
+7. **中断不归档**：服务关停导致的中断，记录变 `failed` 但排队件仍在 `image_queue/`，不进 `failed/`。
+8. **复用已有图**：传 `image_id` 时只写 sidecar，不复制图片，跑完 `data/images/` 张数不变。
+9. **失效记录不空转**：sidecar 里的任务 id 已不存在时直接进 `failed/`，`recovered_total` 不增加。
+10. **旧行为不变**：不传 `roi`、不走队列时，7 个任务与前端行为与第 4 轮一致。
+
+### 9.5 不做的事
+
+- **不做队列持久化的结果**：任务记录（含 `results`）仍在内存，重启后 `404`。要留痕请外部服务存库。
+- **不做多消费者 / 并发推理**：单卡串行是物理约束。
+- **不做自动重试**：业务失败进 `failed/` 就停，重投由调用方决定。只有「服务重启」这条路径会自动重跑。
+- **不做 `failed/` 的自动清理**：删文件涉及丢证据，交给人按 `docs/deployment.md` 的流程处理。
+- **不做跨机共享**：`image_queue/` 依赖同盘 `os.replace` 原子写，网络盘会读到半截文件。
+
+### 9.6 风险与对策
+
+| 风险 | 对策 |
+|---|---|
+| 崩溃点落在「已写 images、未删 sidecar」之间，重启后同一张图跑两遍 | 搬运后立刻把 `image_id` 回填 sidecar，恢复时先查 `data/images/` 是否已有该图，有则跳过重复搬运 |
+| 重启恢复让队列超水位，新投递一直 429 | 有意为之：已回 202 的任务不能因重启被丢；`status.queued` 可见，调用方按 `Retry-After` 退避 |
+| `failed/` 无限增长撑满磁盘 | `status.spool.failed` 暴露堆积量；清理流程写进 `docs/deployment.md` |
+| 写原图成功但写 sidecar 失败，留下孤儿文件 | 返回 500 让调用方重投；孤儿文件检查脚本见 `docs/deployment.md` 7.3 |
+| 队列停用（`queue_enabled=false`）时残留排队件无人处理 | `start` 只在启用时执行，停用期间文件原地保留，重新启用并重启后恢复 |

@@ -8,6 +8,7 @@ from __future__ import annotations
 from .config import (
     DATA_DIR,
     DEVICE_PREFERENCE,
+    IMAGE_QUEUE_DIR,
     MAX_IMAGE_SIDE,
     MODEL_PATH,
     QUEUE_ENABLED,
@@ -19,10 +20,12 @@ from .config import (
 )
 from .protocols.image_store import ImageStore
 from .protocols.job_queue import JobQueue
+from .protocols.job_spool import JobSpool
 from .protocols.proposal_source import ProposalSource
 from .protocols.task_runner import SuiteRunner, TaskRunner
 from .services.image_store import LocalImageStore
-from .services.job_queue import InMemoryJobQueue
+from .services.job_queue import SpoolBackedJobQueue
+from .services.job_spool import LocalJobSpool
 from .services.model_runtime import ModelRuntime
 from .services.suite_runner import DefaultSuiteRunner
 from .services.task_runner import DefaultTaskRunner
@@ -36,10 +39,13 @@ _proposal_source: ProposalSource = WedetectProposalSource(
 )
 _task_runner: TaskRunner = DefaultTaskRunner(_model_runtime, _image_store, _proposal_source)
 _suite_runner: SuiteRunner = DefaultSuiteRunner(_task_runner)
+# 排队缓冲：未处理的图落 data/image_queue/，处理完才搬进 data/images/
+_job_spool: JobSpool = LocalJobSpool(IMAGE_QUEUE_DIR)
 # 队列容量等参数来自 config.ini（queue_*），环境变量 VLX_QUEUE_* 可覆盖
-_job_queue: JobQueue = InMemoryJobQueue(
+_job_queue: JobQueue = SpoolBackedJobQueue(
     _task_runner,
     _image_store,
+    _job_spool,
     capacity=QUEUE_MAX_SIZE,
     max_records=QUEUE_MAX_RECORDS,
     retry_after=QUEUE_RETRY_AFTER,

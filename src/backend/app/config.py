@@ -54,6 +54,12 @@ SHARED_DIR = SRC_ROOT / "shared"
 # 运行时数据（上传图 + 候选框缓存），可随时删除
 DATA_DIR = PROJECT_ROOT / "data" / "images"
 
+# 排队缓冲目录：外部服务推上来但还没轮到处理的图先落这里，处理完才搬进 DATA_DIR。
+# 与 DATA_DIR 分开是有意的——两个目录的**保留语义不同**：
+#   DATA_DIR      处理完的图，想清就清，只影响历史回看；
+#   IMAGE_QUEUE   未处理的图，删掉就等于丢任务，只能按 failed/ 里的记录人工确认后再清。
+IMAGE_QUEUE_DIR = PROJECT_ROOT / "data" / "image_queue"
+
 # 监听地址：uvicorn 启动参数，port 优先级由 run.bat / 启动器处理
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "7860"))

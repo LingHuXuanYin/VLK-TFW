@@ -8,5 +8,6 @@
 - model_runtime.py    模型加载与状态机（唯一持有进程级状态）
 - task_runner.py      单任务：校验 + 派发 + 警告
 - suite_runner.py     全量：串行编排七个任务
-- job_queue.py        生产消费队列：外部推图入队、单消费者串行跑、结果留存
+- job_spool.py        排队缓冲：未处理的图落 data/image_queue/，失败件移 failed/
+- job_queue.py        生产消费队列：落盘入队、单消费者串行跑、重启恢复、结果留存
 """

@@ -5,6 +5,13 @@
 2. `GET /api/queue/jobs/{job_id}` 轮询，`status` 进入终态（succeeded / partially_failed / failed）后取 `results`。
 
 队列满了回 `429`，响应头带 `Retry-After`，响应体 `detail` 就是「队列已超限」的完整说明。
+
+图片的两段式身份（外部服务最容易误解的地方）：
+- 投递后原图落在 `data/image_queue/{job_id}.<ext>`，此时**没有 `image_id`**，响应里是 `null`；
+- 轮到它处理时才搬进 `data/images/` 并生成 `image_id`，之后的 `GET /jobs/{id}` 就能看到。
+所以「投递成功」不等于「图已在图像库」，只等于「已收下并排队」。服务重启不会丢排队图，
+会自动重跑；但**结果记录**只在内存，重启后查不到，要结果得在重启前取走。
+
 本文件只做 HTTP 形状转换（表单字符串 → 列表 / JSON），业务判断全在 `services/job_queue.py`。
 """
 from __future__ import annotations
@@ -49,11 +56,15 @@ async def api_submit_job(
         max_new_tokens / temperature / top_p: 与 `POST /api/tasks/{task}/run` 同义；
                `bbox_list`、`roi`、`target_region_indexes` 传 JSON 字符串。
         client_ref: 调用方业务主键，原样回显，便于对账。
-    返回：`202` + `{ok, job_id, status, position, capacity, tasks, image_id, client_ref, submitted_at}`。
+    返回：`202` + `{ok, job_id, status, position, capacity, tasks, image_source, image_id,
+          image, queued_file, client_ref, submitted_at, attempts, recovered, progress}`。
+          直接推图（`file`）时 `image_id` 为 `null`，`queued_file` 是它在
+          `data/image_queue/` 里的文件名；处理完成后 `image_id` 才有值。
     异常：
         `400` 任务 id 未知 / JSON 字段格式错 / 图片与 image_id 都没给；
         `404` `image_id` 不存在；
         `429` 队列已超限（响应头 `Retry-After` 给出建议重试秒数）；
+        `500` 排队图写盘失败（磁盘满 / 无权限）；
         `503` 队列接入被关闭（`queue_enabled=false`）。
     """
     raw = None
@@ -89,11 +100,12 @@ def api_get_job(job_id: str, queue: JobQueue = Depends(get_job_queue)) -> dict[s
     """查单个任务的快照与结果。
 
     入参：路径参数 `job_id`。
-    返回：`{ok, job_id, status, position, tasks, image_id, client_ref, submitted_at,
-             started_at, finished_at, queue_wait_ms, elapsed_ms, progress, results}`；
+    返回：`{ok, job_id, status, position, tasks, image_source, image_id, image, queued_file,
+             client_ref, submitted_at, started_at, finished_at, queue_wait_ms, elapsed_ms,
+             attempts, recovered, progress, results}`；
           `results` 每项含 `task / ok / answer / result_bbox_list / boxes_source /
           elapsed_ms / warnings / error`。
-    异常：`404` 任务不存在或已被内存保留上限淘汰。
+    异常：`404` 任务不存在或已被内存保留上限淘汰（重启也会清空记录，排队图不受影响）。
     """
     return {"ok": True, **queue.get(job_id)}
 
@@ -118,8 +130,11 @@ def api_queue_status(queue: JobQueue = Depends(get_job_queue)) -> dict[str, Any]
     """队列水位：外部服务据此决定「继续投 / 退避多久」。
 
     返回：`{ok, enabled, consumer_running, capacity, queued, processing, current_job,
-             retry_after, retained, max_records, submitted_total, succeeded_total,
-             failed_total, rejected_total, tasks_run}`。
+             retry_after, retained, max_records, submitted_total, recovered_total,
+             succeeded_total, failed_total, rejected_total, tasks_run,
+             spool: {pending, failed, bytes}}`。
+          `spool.pending` 是 `data/image_queue/` 里还没处理的文件数，`spool.failed` 是
+          `failed/` 里堆积的失败件数（会持续增长，需按 docs/deployment.md 定期清理）。
     异常：无。
     """
     return {"ok": True, **queue.status()}

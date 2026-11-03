@@ -252,3 +252,94 @@
 4. **前端无队列面板**：页面看不到排队水位，只能查 `GET /api/queue/status`。若后续要在调测台上看，属于新需求。
 5. **一个 job 内的任务共用同一组参数**：`text`/`lang`/`roi` 是 job 级的，多任务想用不同 `text` 得拆成多个 job。没有做 per-task overrides（`/api/suite/run` 才有 `overrides`）。
 6. **未新建 `docs/deployment.md`**：沿用上一轮决定——部署面就是「venv + 四个 bat + 启动器 + config.ini」，`README` 的「快速开始」「1.1 启动器」「4.2 队列配置」已覆盖全部步骤与环境变量表。
+
+---
+
+## 2026-11-02 · 排队图落盘：未处理的图进 `image_queue/`，处理完才进 `images/`
+
+### 涉及模块
+
+| 组 | 文件 | 性质 |
+|---|---|---|
+| backend | `services/job_spool.py` | 新增，排队缓冲的唯一实现（原图 + sidecar 原子写、失败件归档） |
+| backend | `protocols/job_spool.py` | 新增，`JobSpool` + `SpoolEntry` 契约 |
+| backend | `services/job_queue.py` | 改写，提交只落排队目录、消费时才搬进图像库、启动恢复 |
+| backend | `protocols/job_queue.py` | 改，`submit` 返回值与 `image_id` 语义、`status` 新增 `spool` / `recovered_total` |
+| backend | `config.py` / `deps.py` | 改，新增 `IMAGE_QUEUE_DIR` 与 `LocalJobSpool` 注入 |
+| backend | `routers/queue.py` / `services/__init__.py` | 改，仅注释与模块索引（HTTP 形状未变） |
+| docs | `deployment.md` | **新建**，运行环境矩阵 / 发布 / 回滚 / 磁盘运维 / 故障处置 |
+
+前端零改动。
+
+### 变更摘要
+
+第 4 轮的队列有两个说不通的地方：排队中的图**在内存里**，而且投递那一刻就已经写进
+`data/images/`——既让「已入库」和「待处理」混成一层，又导致进程一停排队图全丢。本轮按
+「未处理进 `image_queue/`、处理完进 `images/`」重做落盘语义：
+
+- **投递**：容量校验 → 原图**原样**写 `data/image_queue/{job_id}.<ext>` + sidecar → `202`。
+  响应里 `image_id` 为 `null`，`queued_file` 指向排队目录里的文件。不解析图片，所以坏图也能
+  快速收下（处理时才发现，进 `failed/`）。
+- **消费**：读原图 → 解析/缩放 → 写 `data/images/` → 分配的 `image_id` **回填到记录与 sidecar** →
+  跑任务。
+- **终态**：成功删排队件；业务失败（推理炸 / 图坏了 / 参数错）移进 `image_queue/failed/`
+  并在 sidecar 记 `error`、`failed_at`。
+- **服务关停中断不算业务失败**：排队件原地保留，下次启动 `_recover()` 扫描 sidecar 按
+  `submitted_at` 升序重新入队。否则机器重启一次就把整队图全打进失败目录。
+
+三个容易写错的点：
+
+1. **容量判断必须在写盘之前**，否则队列满时磁盘上会留一张没人处理的图。
+2. **原子写**（`.tmp` + `os.replace`）：恢复流程会扫 `*.json`，半截文件会让解析炸掉，直接跳过该条。
+3. **`image_id` 必须回填 sidecar**：崩溃点若落在「已写 images、未删 sidecar」之间，下次启动会
+   重新搬运，`data/images/` 里就多出两张一样的图。回填后 `_materialize` 先查图是否已存在，有则跳过。
+
+### 影响面
+
+- **行为变更（外部服务需要知道）**：`POST /api/queue/jobs` 的响应 `image_id` 从「立刻有值」
+  变成「处理完成后才有值」。想拿 `image_id` 必须等终态后查 `GET /jobs/{id}`。
+- **行为变更（运维需要知道）**：`data/image_queue/` 是新增的运行时目录，**删掉等于丢任务**；
+  `data/image_queue/failed/` 无上限，需定期巡检。
+- **重启语义反转**：第 4 轮是「重启丢排队任务」，现在是「重启自动重跑排队任务」，但结果记录仍丢。
+  README 4.2、product-spec 1.1、requirements 第 9 章三处均已改写，避免留旧说法。
+- **HTTP 路径未增删**：仍是 12 条 `/api`，`queue` 4 个操作。
+- **部署方案已变更**：新增运行时目录 `data/image_queue/`（含 `failed/`）、新增磁盘水位指标
+  `status.spool`、新增清理与孤儿文件检查流程。已同步改 `README.md` 第 9 章（新增「部署」章节，
+  含环境要求 / 启动三入口 / 配置表 / 验证 / 目录清理 / 升级回滚）与新建 `docs/deployment.md`
+  （全量：环境矩阵、运行时目录语义、生命周期、重启恢复、配置、发布、回滚、磁盘运维、监控、故障处置）。
+  启动命令、端口、依赖、`启动器.exe` 打包链路均未变，**不需要重新打包启动器**，但**必须重启服务**。
+
+### 自测结论
+
+两层验证共 66 项断言全过（脚本为临时文件，未入库）：
+
+- **服务层 46 项**（真 `LocalJobSpool` + 真 `LocalImageStore` + 假 runner，不加载模型）：
+  投递后 `image_queue` 有图有 sidecar 而 `images` 为空、`image_id` 为 null、`spool.pending=2`；
+  消费后 `images` 出现该图且文件名等于回填的 `image_id`、`spool` 清空、payload 带上 image_id；
+  并发峰值恒为 1；业务失败与坏图都进 `failed/` 且 sidecar 带 `error`；429 时不落盘且带
+  `Retry-After`；停止后 spool 保留 2 条、重建实例后 `recovered_total=2` 并全部跑完；
+  关停中断后记录 `failed` 但排队件仍在原地、`failed/` 为空；传 `image_id` 只写 sidecar 不复制图；
+  sidecar 里任务 id 失效时直接进 `failed/` 不计入恢复数。
+- **HTTP 层 20 项**（TestClient + 真队列）：`202` 响应含 `queued_file` / `image_source=upload` /
+  `attempts=0` / `recovered=false` 且 `image_id` 为 null，原图落 `image_queue` 而 `images` 仍空；
+  查单个 / 列表 / 水位都带新字段；真实 app 的 OpenAPI 有 3 条 queue 路径、4 个操作、`/api` 共 12 条；
+  `deps` 里装配的确实是 `SpoolBackedJobQueue` 且持有 spool。
+
+静态检查：改动与新增的 7 个 Python 文件 `py_compile` 全过；`data/image_queue/` 与 `failed/`
+在服务导入时自动创建，且被 `.gitignore` 的 `data/` 规则覆盖（`git check-ignore` 确认）。
+
+**未跑真机模型链路**：7860 服务未启动，且现有环境 3090 只有 24.5GB，加载 10B 模型期间再起
+第二个进程会 OOM。队列调用链与 `/api/tasks/{task}/run` 完全相同（同一 `runner.run`），
+本轮只改了「图从哪读、往哪写」，没有新增模型侧耦合。
+
+### 遗留项（明确未做）
+
+1. **结果记录仍不持久化**：重启后 `GET /jobs/{id}` 是 404，只有排队图会重跑。要做「重启后还能查结果」
+   得把记录落库（SQLite），属于新需求。
+2. **`failed/` 不自动清理**：删文件等于删证据，交给人按 `docs/deployment.md` 7.2 的流程处理。
+3. **不做自动重试**：业务失败进 `failed/` 就停，重投由调用方决定。
+4. **崩溃窗口内可能重复搬运**：已用「回填 image_id + 先查图是否存在」把窗口压到极窄，
+   但严格的一次性语义需要事务型存储，本轮不做。
+5. **不支持跨机共享排队目录**：依赖同盘 `os.replace` 原子写，网络盘会读到半截文件。
+6. **`启动器.exe` 仍是旧 `launcher.py` 打包的**（沿用上一轮遗留）：要用修复版「改端口不抹
+   `queue_*`」的行为，仍需重跑 `build_launcher.bat`。
